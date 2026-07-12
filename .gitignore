@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- RAG project-specific ---
+# Local Qdrant vector storage (model-specific, large) — rebuild via ingest scripts
+qdrant_db/
+# S2 parent docstore — derived, fast to rebuild
+s2_docstore/
+# Raw source PDFs (large binaries) — not committed; cache/*.json and *.md derived from them ARE committed
+data/raw_sources/

@@ -1,0 +1,7 @@
+docling
+qdrant-client
+fastembed
+ollama
+langchain-text-splitters
+tqdm
+matplotlib
