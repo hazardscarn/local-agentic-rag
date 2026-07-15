@@ -224,3 +224,6 @@ qdrant_db/
 s2_docstore/
 # Raw source PDFs (large binaries) — not committed; cache/*.json and *.md derived from them ARE committed
 data/raw_sources/
+# edenview_ingestion's temp extraction workspace (picture/table crops, opt-in parse cache)
+.edenview_tmp/
+test/docling-parsing/

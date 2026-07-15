@@ -1,0 +1,17 @@
+{
+  "company_name": "string",
+  "filing_period": "string",
+  "operating_revenue": "float",
+  "net_income": "float",
+  "currency": "string",
+  "total_assets": "float",
+    "total_liabilities": "float",
+    "acquisitions": [
+      {
+        "acquired_company_name": "string",
+        "acquisition_date": "string",
+        "acquisition_amount": "float"
+      }
+    ],
+    "net_assets_acquired": "float"
+}

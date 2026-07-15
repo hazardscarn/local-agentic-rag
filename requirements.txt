@@ -1,4 +1,5 @@
 docling
+pandas
 qdrant-client
 fastembed
 ollama
