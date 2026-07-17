@@ -1,0 +1,152 @@
+# Global model configuration for the Edenview ingestion stack. Every model name used
+# anywhere in the pipeline is declared here -- nothing should hardcode a model name in
+# Python; load it through edenview_ingestion.settings instead. See that module's
+# docstring for how this file is read.
+
+models:
+  # Token-counting tokenizer for HybridChunker-based strategies (hybrid_docling,
+  # parent_child, contextual) -- not an embedding model itself, just used to size
+  # chunks in tokens. Kept aligned to the dense embedding model below (same model =
+  # this is no longer a placeholder, chunk token budgets now match what the embedder
+  # actually sees).
+  tokenizer: BAAI/bge-m3
+
+  # Dense embedding model, served via Ollama. Chosen over qwen3-embedding:0.6b (the
+  # edenview_plan.md default) because it's already proven end-to-end in
+  # ingest/shared.py (dense+sparse+RRF hybrid), already pulled, fits the 6GB VRAM
+  # budget, and doubles as the tokenizer above -- one model instead of two to track.
+  dense_embedding: bge-m3
+  dense_embedding_dim: 1024
+
+  # Sparse (BM25) embedding model via FastEmbed, ONNX/CPU-only -- no GPU/VRAM cost.
+  # Paired with dense_embedding + Qdrant's native RRF fusion for hybrid search, per
+  # edenview_plan.md's differentiation bet on hybrid retrieval.
+  sparse_embedding: Qdrant/bm25
+
+  # Ollama chat model used by the contextual chunker to generate one context sentence
+  # per chunk. Chosen for the 6GB VRAM budget noted in rag_vector_db_ingestion_plan.md.
+  contextual_llm: qwen3.5:2b
+
+  # Ollama chat model used by the /chat endpoint to generate an answer from retrieved
+  # context. A separate key from contextual_llm on purpose -- they serve different
+  # jobs (context-sentence generation at ingest time vs. answering a user's question
+  # at query time) and are independently overridable from the Settings UI, even
+  # though they default to the same model today for the same 6GB VRAM budget reason.
+  chat_llm: granite4.1:3b
+
+  # Ollama vision-capable model used by Docling's picture-description enrichment
+  # (do_picture_description) to caption retained images at extraction time. Small on
+  # purpose -- picture captioning doesn't need a large model, and this has to coexist
+  # in VRAM with the dense embedder during ingestion (6GB budget, see
+  # rag_vector_db_ingestion_plan.md). Not yet pulled locally as of this writing -- run
+  # `ollama pull qwen3-vl:2b` before enabling do_picture_description=True.
+  picture_description_llm: qwen3-vl:2b
+
+  # Cross-encoder reranker via FastEmbed, ONNX/CPU-only -- no GPU cost, same story as
+  # sparse_embedding above. Scores (query, chunk) pairs on a comparable absolute-ish
+  # scale, which is what makes merging results across *multiple* Qdrant collections
+  # sound (raw RRF fusion scores are only comparable within one collection's own
+  # query) -- see edenview_ingestion/retrieval/.
+  reranker: Xenova/ms-marco-MiniLM-L-6-v2
+
+agent:
+  # Ollama chat model driving the agentic RAG loop (edenview_RAG/agentic_rag) --
+  # a separate key from models.chat_llm since Simple RAG and Agentic RAG are
+  # independently overridable modes. MUST be tool-calling-capable; image-inspection
+  # in the "high" effort tier additionally requires a vision-capable model, checked
+  # at runtime via `ollama show <model>`'s reported `capabilities` list rather than
+  # assumed -- if the configured model isn't multimodal, the image-inspection tool
+  # is simply not registered (no error, just that one capability silently
+  # unavailable). qwen3.5:2b is confirmed vision+tools+thinking-capable and already
+  # pulled; qwen3.5:4b is a same-family drop-in upgrade once pulled. Note: running
+  # a *different* model here than models.chat_llm means both can end up
+  # Ollama-resident at once if a user swaps between Simple/Agentic mode within one
+  # keep_alive window -- fine on this 6GB budget alongside bge-m3, but worth knowing.
+  model: qwen3.5:4b
+  # Ollama's actual runtime context window for this model -- NOT the same as the
+  # model's own max supported context (qwen3.5:4b supports up to 262144, but Ollama's
+  # *request-time* num_ctx parameter silently defaults to ~2048 regardless of that).
+  # Confirmed by direct reproduction: a real retrieved-context prompt (~63,000 chars)
+  # got silently truncated to prompt_eval_count=2050 tokens with no override set --
+  # cutting off the actual question at the end of the prompt entirely, and the model
+  # answered a jumbled truncated fragment instead, which looked exactly like
+  # hallucination/poor grounding until this was traced to its real cause. Same
+  # category of bug as vectorstore/embedding.py's num_batch=4096 fix for bge-m3 --
+  # Ollama's own default doesn't scale with what the model or the request actually
+  # needs. Briefly bumped to 32768 to chase a "medium" tier issue that turned out to
+  # be a different bug (subagent.py's critic/answer steps carrying unnecessary full
+  # conversation history -- fixed via include_contents="none" on those two, see their
+  # docstrings) -- reverted back down after confirming a large num_ctx causes its own
+  # real problem on this 6GB GPU: Ollama reserves KV cache for the FULL requested
+  # num_ctx upfront regardless of actual prompt length, and 32768 pushed the
+  # model+cache past VRAM, causing CPU-offload slowdowns severe enough to blow a
+  # 600s timeout on calls that used to complete in seconds. 16384 is the confirmed-
+  # working value for a real single-shot retrieved-context prompt (low tier); raise
+  # only alongside confirming VRAM headroom (see GET /system/info) if a higher
+  # top_k/larger chunks/more max_iterations genuinely need more.
+  num_ctx: 16384
+  # Which of the three pre-built agent trees (low/medium/high) a request uses when
+  # not explicitly specified -- see edenview_RAG/agentic_rag for what each tier does.
+  default_effort: high
+  # Hard cap on the critic/refiner refinement loop's iterations per tier -- the loop
+  # is expected to usually exit early (the critic signals satisfaction), this is
+  # just the ceiling so a weak local model can't get stuck looping forever. "low"
+  # has no loop at all (single retrieve-then-answer), so it isn't listed here.
+  max_iterations:
+    medium: 2
+    high: 4
+
+ollama:
+  host: http://localhost:11434
+  # How long a model stays loaded in RAM/VRAM after its last call before Ollama
+  # evicts it -- an idle timer that resets on every call, not a fixed schedule from
+  # first load (confirmed against Ollama's own scheduler behavior). Passed explicitly
+  # on every Ollama call this app makes (embedding, chat, contextual chunking,
+  # picture description) instead of relying on Ollama's own 5-minute default, so a
+  # normal gap between chat messages or ingestion steps doesn't force a disk reload.
+  # Same duration syntax Ollama itself accepts: "30m", "1h", "-1" (never auto-evict),
+  # "0" (unload immediately -- what the Settings page's "Unload" button uses instead
+  # of this key). Deliberately not -1 by default: two models (~3.6GB combined on the
+  # 6GB-VRAM target hardware this was tuned for) sitting loaded forever would eat
+  # into headroom other models need -- 30 minutes covers a normal working session
+  # while still self-cleaning an abandoned one.
+  keep_alive: 30m
+
+# Root folder for every piece of data Edenview builds locally: the embedded Qdrant
+# vector store (qdrant_db/, same engine as server mode -- only one OS process can hold
+# it open at a time, which is why Edenview runs as a single long-lived process rather
+# than a multi-service split), the DuckDB catalog (catalog.duckdb -- the DB/Collection/
+# Document metadata store, never holds vectors or chunk text), and permanent
+# per-document storage (documents/ -- parse cache, picture/table crops, and preserved
+# original PDFs for visual grounding). Editable from Settings -> Workspace.
+#
+# IMPORTANT: set this once, right after installing, and don't change it casually --
+# every collection, chat session, and document you've ingested lives under this path.
+# Changing it here does NOT move that data; it just points a fresh process at a
+# different (likely empty) folder, making everything you built look like it vanished
+# until you point it back. Keep it on a local, always-available disk -- a network
+# drive or a removable/external drive that isn't always connected will make Qdrant's
+# embedded mode and DuckDB's file locking unreliable (stalls, "database is locked"
+# errors, or corruption on a dropped connection), since neither is designed to run its
+# storage over the network.
+workspace:
+  root: D:/Work/Github/local-agentic-rag/edenview_data
+
+# Extraction performance knobs -- both null by default, meaning "auto-detect from
+# whatever machine this is running on" rather than a value tuned to one dev machine
+# (see edenview_ingestion.settings.get_num_threads()/get_page_batch_size()). Editable
+# from Settings -> Performance.
+performance:
+  # Threads Docling's own pipeline uses per extraction. null = cpu_count - 2 (min 1),
+  # leaving headroom for the OS/other apps -- set an explicit number to override.
+  num_threads: null
+  # Pages of a single document Docling batches together internally -- a process-wide
+  # Docling setting (not per-document), its own default is 4. null = that default.
+  page_batch_size: null
+  # How many documents can run extraction (model loading + inference -- the actual
+  # resource-hungry step) at the same time. null = 4. Confirmed necessary by
+  # reproduction: ingesting many files at once with no limit ran every extraction
+  # simultaneously, oversubscribing CPU threads, RAM, and a shared GPU badly enough
+  # that the whole batch was far slower than a few at a time would have been.
+  # Requires a backend restart to take effect.
+  max_concurrent_extractions: null

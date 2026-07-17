@@ -12,9 +12,22 @@ from __future__ import annotations
 import os
 import re
 
-from docling_core.types.doc.document import DoclingDocument, PictureItem, TextItem
+from docling_core.types.doc.document import DoclingDocument, PictureDescriptionData, PictureItem, TextItem
 
 from .models import PictureRecord
+
+
+def _picture_description(picture: PictureItem) -> str | None:
+    """Reads `picture.meta.description.text` -- the current API. `picture.annotations`
+    (iterated as a fallback) is deprecated in this docling-core version and, confirmed
+    by inspection, the picture-description enrichment stage writes straight to `meta`
+    without populating it, so the fallback alone silently returned nothing."""
+    if picture.meta is not None and picture.meta.description is not None:
+        return picture.meta.description.text or None
+    for annotation in picture.annotations:
+        if isinstance(annotation, PictureDescriptionData):
+            return annotation.text or None
+    return None
 
 
 def _slug(label: str) -> str:
@@ -96,6 +109,7 @@ def build_picture_records(
                 classification_confidence=classification_confidence,
                 image_path=image_path,
                 linked_text_refs=_nearest_text_refs(ordered_items, picture_index),
+                description=_picture_description(picture),
             )
         )
     return records

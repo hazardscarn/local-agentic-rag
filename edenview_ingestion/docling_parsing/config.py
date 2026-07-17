@@ -15,6 +15,8 @@ from docling.datamodel.accelerator_options import AcceleratorDevice, Accelerator
 from docling.datamodel.pipeline_options import OcrOptions, TableFormerMode
 from pydantic import BaseModel, ConfigDict, Field
 
+from edenview_ingestion.settings import get_num_threads, get_page_batch_size
+
 # docling-project/DocumentFigureClassifier-v2.5's 26 labels, minus the ones with no
 # retrieval value for RAG -- decorative/administrative marks, never the document's
 # actual content. Everything else (charts, plots, diagrams, tables, maps, photographs,
@@ -106,9 +108,23 @@ class ExtractionConfig(BaseModel):
     # label to check, nothing gets filtered.
     picture_exclude_labels: frozenset[str] = DEFAULT_PICTURE_EXCLUDE_LABELS
 
-    # Performance / offline operation
+    # Performance / offline operation. num_threads and page_batch_size both come from
+    # edenview_ingestion.settings, which auto-detects a sensible value for whatever
+    # machine this package actually runs on (see get_num_threads()) unless a user has
+    # set an explicit override in Settings -> Performance -- Edenview is meant to be
+    # installed and run by anyone, not tuned to one dev machine's core count or GPU, so
+    # a hardcoded number here would under-use a bigger machine and doesn't help a
+    # smaller one either. accelerator_device=AUTO already lets Docling itself pick
+    # CUDA/MPS/CPU per-machine; a user with a CUDA-capable GPU gets it automatically
+    # once they've installed a CUDA-enabled torch build for their own hardware (an
+    # install-time choice -- see scripts/install_torch.py -- not something this package
+    # should hardcode into requirements.txt).
     accelerator_device: AcceleratorDevice = AcceleratorDevice.AUTO
-    num_threads: int = 4
+    num_threads: int = Field(default_factory=get_num_threads)
+    # Not a Docling PdfPipelineOptions field -- a process-wide Docling setting
+    # (docling.datamodel.settings.settings.perf.page_batch_size) applied once per
+    # extraction call in extractor.py, since Docling has nowhere to take it per-call.
+    page_batch_size: int = Field(default_factory=get_page_batch_size)
     artifacts_path: Optional[str] = None
 
     storage: StorageConfig = Field(default_factory=StorageConfig)

@@ -1,8 +1,42 @@
-docling
-pandas
-qdrant-client
-fastembed
-ollama
-langchain-text-splitters
-tqdm
-matplotlib
+# Pinned to the exact versions this project is developed and tested against --
+# reinstalling from this file should reproduce a known-compatible environment rather
+# than whatever happens to be newest on PyPI that day (docling/transformers/torch in
+# particular move fast enough that "latest" can silently break chunking/extraction).
+#
+# Deliberately NOT a `pip freeze` dump: this lists only this project's own direct
+# dependencies (what's actually imported somewhere in the codebase), not the full
+# transitive closure -- keeps this file readable and lets pip's own resolver work out
+# compatible versions of everything each of these depends on.
+#
+# torch itself is intentionally NOT listed here -- it's a transitive dependency of
+# docling/transformers, and which build (CPU vs. a specific CUDA channel) is a
+# per-machine install-time choice, not a fixed version to pin. See
+# scripts/install_torch.py and torch_installation.md.
+docling==2.103.0
+pypdfium2==5.10.1
+pandas==3.0.3
+qdrant-client==1.18.0
+fastembed==0.8.0
+ollama==0.6.2
+langchain-text-splitters==1.1.2
+transformers==5.12.1
+pyyaml==6.0.3
+ruamel.yaml==0.19.1
+duckdb==1.5.4
+fastapi==0.139.0
+uvicorn==0.51.0
+python-multipart==0.0.32
+psutil==7.2.2
+tqdm==4.68.3
+matplotlib==3.11.0
+
+# edenview_RAG/agentic_rag -- ADK-based agentic RAG loop (Simple RAG's chat_llm above
+# is unaffected; this powers the separate "Agentic RAG" chat mode).
+# litellm pinned to 1.77.7 specifically: pip's default resolution (1.92.0 at time of
+# writing) has no prebuilt wheel and falls back to a source build that requires a
+# Rust/Cargo toolchain not set up on this machine -- 1.77.7 has a plain py3-none-any
+# wheel and installs cleanly. Re-check wheel availability before bumping this pin.
+google-adk==2.5.0
+litellm==1.77.7
+sqlalchemy==2.0.51
+aiosqlite==0.22.1

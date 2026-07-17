@@ -8,6 +8,7 @@ from .models import (
     PictureRecord,
     TableRecord,
 )
+from .picture_description import generate_picture_descriptions
 
 __all__ = [
     "DoclingExtractor",
@@ -20,4 +21,5 @@ __all__ = [
     "DoclingParsingError",
     "UnsupportedFormatError",
     "ExtractionFailedError",
+    "generate_picture_descriptions",
 ]

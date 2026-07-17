@@ -227,3 +227,10 @@ data/raw_sources/
 # edenview_ingestion's temp extraction workspace (picture/table crops, opt-in parse cache)
 .edenview_tmp/
 test/docling-parsing/
+# verify_chunking.py's picture/table crop output -- the script itself IS committed
+test/chunking/cache/
+# The whole local Edenview data root -- embedded Qdrant store, DuckDB catalog, and
+# permanent per-document images (config.yaml's qdrant/catalog/storage paths). Real user
+# data, instance-specific, never committed -- same reasoning as qdrant_db/ above.
+edenview_data/
+data/

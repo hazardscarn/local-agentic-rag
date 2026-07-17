@@ -33,6 +33,7 @@ from . import _bootstrap  # noqa: F401 -- must run before the docling imports be
 from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 from docling.datamodel.base_models import ConversionStatus, InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, TableStructureOptions
+from docling.datamodel.settings import settings as docling_settings
 from docling.document_converter import DocumentConverter, ImageFormatOption, PdfFormatOption
 from docling.exceptions import ConversionError
 from docling_core.types.doc.document import DoclingDocument
@@ -65,6 +66,14 @@ def _build_pdf_pipeline_options(config: ExtractionConfig) -> PdfPipelineOptions:
     opts.do_picture_classification = config.do_picture_classification
     opts.do_code_enrichment = config.do_code_enrichment
     opts.do_formula_enrichment = config.do_formula_enrichment
+    # Picture *description* (captioning) deliberately does NOT go through Docling's own
+    # do_picture_description/PictureDescriptionApiOptions here -- confirmed broken for
+    # reasoning-capable local VLMs (e.g. qwen3-vl): Ollama's OpenAI-compatible endpoint
+    # puts the model's real output in a separate `reasoning` field, and Docling's parser
+    # only reads `content`, so it comes back empty every time. See
+    # docling_parsing/picture_description.py, which calls Ollama's native API directly
+    # against the crop files this module already saves -- that API correctly separates
+    # content from reasoning, and was verified working end-to-end.
     opts.accelerator_options = config.accelerator_options()
     if config.artifacts_path is not None:
         opts.artifacts_path = config.artifacts_path
@@ -178,6 +187,13 @@ class DoclingExtractor:
         return bundle
 
     def _convert(self, source: Path):
+        # page_batch_size lives on Docling's own process-wide settings object, not on
+        # PdfPipelineOptions -- set right before use rather than only at __init__ time,
+        # since it's shared across every DoclingExtractor in this process regardless of
+        # each one's own `config`. In practice this is safe: the value always comes from
+        # one shared app config (settings.get_page_batch_size()), not a per-job
+        # parameter, so concurrent extractions never actually want different values.
+        docling_settings.perf.page_batch_size = self.config.page_batch_size
         try:
             return self._converter.convert(
                 str(source),

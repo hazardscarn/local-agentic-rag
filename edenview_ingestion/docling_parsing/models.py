@@ -54,6 +54,10 @@ class PictureRecord(BaseModel):
     # self_refs of the nearest surrounding text items, in reading order -- how a
     # retrieved text chunk can pull this image in by metadata without a vision embedder.
     linked_text_refs: list[str]
+    # VLM-generated caption, populated by picture_description.generate_picture_descriptions()
+    # as a separate post-extraction step (not part of extract() itself) -- see that
+    # module for why this isn't done through Docling's own enrichment pipeline.
+    description: Optional[str] = None
 
 
 class ExtractionBundle(BaseModel):
