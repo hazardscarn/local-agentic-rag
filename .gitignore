@@ -273,6 +273,7 @@ edenview_plan.md
 edenview_progress.md
 rag_vector_db_ingestion_plan.md
 rules.md
+torch_installation.md
 
 ingest/
 query/
