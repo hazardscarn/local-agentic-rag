@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { getSystemInfo, unloadOllamaModel } from "@/lib/api";
 import { AreaChart } from "@/components/layout/area-chart";
+import type { LoadedModelInfo } from "@/lib/types";
 import { MemoryStick, Loader2, X, ChevronDown, ChevronUp, Activity } from "lucide-react";
 
 // 15 samples @ 4s = a clean 60s rolling window.
@@ -17,6 +18,21 @@ function minutesUntil(iso: string | null): string | null {
   const mins = Math.round((new Date(iso).getTime() - Date.now()) / 60_000);
   if (mins <= 0) return "evicting…";
   return `${mins}m left`;
+}
+
+// Ollama has no separate "% on GPU" field -- it's derived the same way `ollama ps`
+// derives its own CPU/GPU split column: size_vram_gb is the slice of the model's
+// total size that made it into VRAM, so the rest is necessarily running on CPU.
+function gpuSplit(m: LoadedModelInfo): { gpuPct: number; cpuPct: number } | null {
+  if (!m.size_gb) return null;
+  const gpuPct = Math.max(0, Math.min(100, Math.round((m.size_vram_gb / m.size_gb) * 100)));
+  return { gpuPct, cpuPct: 100 - gpuPct };
+}
+
+function gpuSplitLabel(split: { gpuPct: number; cpuPct: number }): string {
+  if (split.gpuPct === 100) return "100% GPU";
+  if (split.cpuPct === 100) return "100% CPU";
+  return `${split.gpuPct}% GPU / ${split.cpuPct}% CPU`;
 }
 
 export function SystemMonitor() {
@@ -102,22 +118,49 @@ export function SystemMonitor() {
               <p className="flex items-center gap-1 text-[11px] font-medium text-sidebar-foreground/70">
                 <MemoryStick className="size-3" /> Loaded in Ollama
               </p>
-              {data.loaded_models.map((m) => (
-                <div key={m.name} className="flex items-center justify-between gap-1 text-[11px] text-sidebar-foreground/60">
-                  <span className="truncate" title={`${m.name} · ${m.size_vram_gb}GB VRAM · ${minutesUntil(m.expires_at) ?? ""}`}>
-                    {m.name} · {m.size_vram_gb}GB
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => unloadMutation.mutate(m.name)}
-                    disabled={unloadMutation.isPending}
-                    className="shrink-0 rounded p-0.5 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground disabled:opacity-50"
-                    title="Unload from memory now"
-                  >
-                    <X className="size-3" />
-                  </button>
-                </div>
-              ))}
+              {data.loaded_models.map((m) => {
+                const split = gpuSplit(m);
+                return (
+                  <div key={m.name} className="flex flex-col gap-1">
+                    <div className="flex items-center justify-between gap-1 text-[11px] text-sidebar-foreground/60">
+                      <span className="truncate" title={`${m.name} · ${m.size_vram_gb}GB VRAM · ${minutesUntil(m.expires_at) ?? ""}`}>
+                        {m.name} · {m.size_vram_gb}GB
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => unloadMutation.mutate(m.name)}
+                        disabled={unloadMutation.isPending}
+                        className="shrink-0 rounded p-0.5 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground disabled:opacity-50"
+                        title="Unload from memory now"
+                      >
+                        <X className="size-3" />
+                      </button>
+                    </div>
+                    {split && (
+                      <div className="flex items-center gap-1.5 pl-0.5" title="Share of this model's memory resident in VRAM vs. spilled to system RAM">
+                        <div className="flex h-1 w-full overflow-hidden rounded-full">
+                          {split.gpuPct > 0 && (
+                            <div
+                              className="h-full rounded-full bg-[#008300] dark:bg-[#00a300]"
+                              style={{ width: `${split.gpuPct}%` }}
+                            />
+                          )}
+                          {split.gpuPct > 0 && split.cpuPct > 0 && <div className="w-[2px]" />}
+                          {split.cpuPct > 0 && (
+                            <div
+                              className="h-full rounded-full bg-[#2a78d6] dark:bg-[#3987e5]"
+                              style={{ width: `${split.cpuPct}%` }}
+                            />
+                          )}
+                        </div>
+                        <span className="shrink-0 text-[9px] tabular-nums text-sidebar-foreground/40">
+                          {gpuSplitLabel(split)}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </>
