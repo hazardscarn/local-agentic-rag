@@ -67,3 +67,14 @@ Actively developed, local-first, single-user by design. Built and tuned against 
 modest (~6GB VRAM) GPU, but every model choice and performance knob is
 user-configurable from Settings for other hardware — see `USER_GUIDE.md`'s
 prerequisites section for picking your own models.
+
+## License
+
+Source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE) —
+free to use, modify, and share for personal use, research, and any other
+noncommercial purpose. **Commercial use requires a separate license from the
+copyright holder.** If you want to use this commercially, open an issue on this
+repository describing your intended use; terms (which may include attribution,
+royalties, or a flat license fee) are worked out case by case.
+
+© 2026 David Babu, Eden Blue Labs.
