@@ -2,15 +2,19 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { getChatSession, runChat, runChatStream } from "@/lib/api";
+import { getChatSession, reattachChatStream, runChat, runChatStream } from "@/lib/api";
 import { ChatScopePanel, type ChatScope } from "@/components/chat/chat-scope-panel";
 import { ChatMessage, type ChatTurn } from "@/components/chat/chat-message";
 import { ChatSessionList } from "@/components/chat/chat-session-list";
 import { GroundingPanel, type GroundingTarget } from "@/components/chat/grounding-panel";
+import { AgentPipelinePanel } from "@/components/chat/agent-pipeline-panel";
+import { AgentTrace } from "@/components/chat/agent-trace";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
-import type { RetrievalHit } from "@/lib/types";
-import { Send, Loader2, Sparkles, PanelRightOpen } from "lucide-react";
+import type { AgenticStatusEvent, RetrievalHit } from "@/lib/types";
+import { pipelineReducer, initialPipelineState, type PipelineState } from "@/lib/pipeline-state";
+import { cn } from "@/lib/utils";
+import { Send, Loader2, Sparkles, PanelRightOpen, PanelLeftOpen, ChevronRight } from "lucide-react";
 
 const DEFAULT_SCOPE: ChatScope = {
   collectionNames: [],
@@ -19,7 +23,6 @@ const DEFAULT_SCOPE: ChatScope = {
   strategy: "",
   chatModel: "",
   agentic: false,
-  effort: "high",
 };
 
 // Persisted across navigation/reloads -- a per-browser preference (which db/
@@ -67,6 +70,7 @@ export default function ChatPage() {
     }
   }, [scope]);
   const [scopePanelOpen, setScopePanelOpen] = useState(true);
+  const [sessionListOpen, setSessionListOpen] = useState(true);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [input, setInput] = useState("");
@@ -97,18 +101,54 @@ export default function ChatPage() {
   }, [turns]);
 
   const [agenticStatus, setAgenticStatus] = useState<string | null>(null);
+  // True only while reattaching to an already-running turn found on session load
+  // (see the effect below) -- distinct from agenticMutation.isPending, which only
+  // covers a turn started by THIS tab's own send(). Folded into isPending/canSend
+  // below so the input/send button/pipeline panel all already gate on it correctly.
+  const [reattaching, setReattaching] = useState(false);
+  // Live per-node/tool pipeline view -- additive alongside agenticStatus above (that
+  // single-line text is untouched). Auto-opens when an agentic turn starts, persists
+  // the last completed turn's pipeline until the next one begins (not reset on
+  // success/error -- only when a new agentic send() fires). pipelineRef mirrors
+  // `pipeline` synchronously (unlike the state, which batches) so onSuccess below can
+  // reliably snapshot the FINAL state into the completed turn -- reading `pipeline`
+  // directly there risked capturing a stale pre-final-dispatch value depending on
+  // React's render timing.
+  const [pipeline, setPipeline] = useState<PipelineState>(initialPipelineState);
+  const pipelineRef = useRef<PipelineState>(initialPipelineState);
+  const [pipelinePanelOpen, setPipelinePanelOpen] = useState(false);
+  // Explicit, controlled open/closed state for the LIVE trace disclosure below --
+  // deliberately NOT a plain `<details open>` (a constant, not stateful, JSX
+  // attribute), since `pipeline` re-renders this component on every streamed event;
+  // an uncontrolled `open` would get reasserted on each of those re-renders,
+  // silently undoing a user's manual collapse-click moments later.
+  const [liveTraceOpen, setLiveTraceOpen] = useState(true);
+  const dispatchPipeline = (event: AgenticStatusEvent) => {
+    pipelineRef.current = pipelineReducer(pipelineRef.current, event);
+    setPipeline(pipelineRef.current);
+  };
 
-  const onChatSuccess = (res: {
-    session_id: string;
-    answer: string;
-    citations: RetrievalHit[];
-    model_used: string;
-    thinking?: string | null;
-  }) => {
+  const onChatSuccess = (
+    res: {
+      session_id: string;
+      answer: string;
+      citations: RetrievalHit[];
+      model_used: string;
+      thinking?: string | null;
+    },
+    pipelineTrace?: PipelineState,
+  ) => {
     setSessionId(res.session_id);
     setTurns((t) => [
       ...t,
-      { role: "assistant", content: res.answer, citations: res.citations, modelUsed: res.model_used, thinking: res.thinking ?? undefined },
+      {
+        role: "assistant",
+        content: res.answer,
+        citations: res.citations,
+        modelUsed: res.model_used,
+        thinking: res.thinking ?? undefined,
+        pipelineTrace,
+      },
     ]);
     queryClient.invalidateQueries({ queryKey: ["chat-sessions"] });
   };
@@ -118,23 +158,96 @@ export default function ChatPage() {
 
   const mutation = useMutation({
     mutationFn: runChat,
-    onSuccess: onChatSuccess,
+    // Explicitly wrapped (not `onSuccess: onChatSuccess`) -- react-query calls
+    // onSuccess as (data, variables, context), and passing onChatSuccess directly
+    // would make its own `pipelineTrace` param receive react-query's `variables`
+    // (the request body) instead of undefined, for Simple RAG turns.
+    onSuccess: (res) => onChatSuccess(res),
     onError: onChatError,
   });
 
+  // Only "start" events (and root-level relayed ones) carry a human-readable
+  // `message` -- "end" events carry `duration_s` instead, no message. Skip those
+  // for this simple status-line display rather than blanking it on every node's
+  // completion; a future flowchart-style view would use the full event (node/
+  // phase/duration_s) instead of just this derived line.
+  const handleAgenticStatus = (event: AgenticStatusEvent) => {
+    if (event.message) setAgenticStatus(event.message);
+  };
+
+  // Reattaches to a still-running agentic turn when a session is (re)loaded --
+  // covers both switching back to a session left mid-turn and a plain page reload,
+  // neither of which the old design could recover: live status was only ever
+  // driven by the ONE browser tab's own fetch/React state for the ONE connection
+  // that started it (confirmed directly: the server-side turn keeps running and
+  // persists its answer regardless of whether any client is watching, so a lost
+  // connection was never a lost turn -- just a lost VIEW of it). The only
+  // reliable, already-available signal that a turn might still be in flight is
+  // the persisted messages themselves: the last one is from the user with no
+  // assistant reply after it yet (see api/routers/chat.py's GET
+  // /chat/stream/{session_id}, which resolves this definitively either way --
+  // replaying/continuing a real in-flight turn, or a single cheap "not_running"
+  // event if there's nothing to reattach to).
+  useEffect(() => {
+    if (!sessionDetail || !scope.agentic) return;
+    const messages = sessionDetail.messages;
+    const lastIsDanglingUser = messages.length > 0 && messages[messages.length - 1].role === "user";
+    if (!lastIsDanglingUser) return;
+
+    const controller = new AbortController();
+    setReattaching(true);
+    pipelineRef.current = initialPipelineState;
+    setPipeline(initialPipelineState);
+    setPipelinePanelOpen(true);
+    setAgenticStatus("Reconnecting…");
+
+    reattachChatStream(
+      sessionDetail.session_id,
+      (event) => {
+        handleAgenticStatus(event);
+        dispatchPipeline(event);
+      },
+      () => setAgenticStatus("Thinking..."),
+      controller.signal,
+    )
+      .then((res) => {
+        setAgenticStatus(null);
+        if (res) onChatSuccess(res, pipelineRef.current); // null -- nothing was actually in flight, leave turns as-is
+      })
+      .catch((err) => {
+        if (controller.signal.aborted) return; // navigated away again -- not a real error
+        setAgenticStatus(null);
+        onChatError(err instanceof Error ? err : new Error(String(err)));
+      })
+      .finally(() => setReattaching(false));
+
+    return () => controller.abort();
+    // Deliberately only depends on sessionDetail -- this should re-run when the
+    // session's own persisted messages change, not on every render of the
+    // (stable-in-practice) callbacks it closes over below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionDetail]);
+
   // Separate mutation for agentic mode -- POST /chat/stream (see lib/api.ts's
-  // runChatStream) surfaces live progress via onStatus while ADK's agent loop runs,
-  // since a "high" effort turn can genuinely take 30-90+ seconds and a bare spinner
-  // reads as broken for that long. onThinking accumulates the agent's own reasoning
+  // runChatStream) surfaces live progress via onStatus while the ADK pipeline runs,
+  // since a real turn can genuinely take several minutes and a bare spinner reads
+  // as broken for that long. onThinking accumulates the agent's own reasoning
   // narration chunks as they stream in, purely for a "thinking so far..." status
   // line -- the full text ultimately comes back on the result event (res.thinking)
   // and is what actually gets attached to the turn, not this running buffer.
   const agenticMutation = useMutation({
     mutationFn: (body: Parameters<typeof runChatStream>[0]) =>
-      runChatStream(body, setAgenticStatus, () => setAgenticStatus("Thinking...")),
+      runChatStream(
+        body,
+        (event) => {
+          handleAgenticStatus(event);
+          dispatchPipeline(event);
+        },
+        () => setAgenticStatus("Thinking..."),
+      ),
     onSuccess: (res) => {
       setAgenticStatus(null);
-      onChatSuccess(res);
+      onChatSuccess(res, pipelineRef.current);
     },
     onError: (err: Error) => {
       setAgenticStatus(null);
@@ -142,7 +255,7 @@ export default function ChatPage() {
     },
   });
 
-  const isPending = mutation.isPending || agenticMutation.isPending;
+  const isPending = mutation.isPending || agenticMutation.isPending || reattaching;
   const hasScope = scope.collectionNames.length > 0;
   const canSend = hasScope && input.trim().length > 0 && !isPending;
 
@@ -178,7 +291,10 @@ export default function ChatPage() {
     };
     if (scope.agentic) {
       setAgenticStatus("Starting...");
-      agenticMutation.mutate({ ...body, effort: scope.effort });
+      pipelineRef.current = initialPipelineState;
+      setPipeline(initialPipelineState);
+      setPipelinePanelOpen(true);
+      agenticMutation.mutate(body);
     } else {
       mutation.mutate(body);
     }
@@ -186,7 +302,23 @@ export default function ChatPage() {
 
   return (
     <div className="flex h-full min-h-0 flex-1">
-      <ChatSessionList activeSessionId={sessionId} onSelect={handleSelectSession} onNewChat={handleNewChat} />
+      {sessionListOpen ? (
+        <ChatSessionList
+          activeSessionId={sessionId}
+          onSelect={handleSelectSession}
+          onNewChat={handleNewChat}
+          onCollapse={() => setSessionListOpen(false)}
+        />
+      ) : (
+        <button
+          type="button"
+          onClick={() => setSessionListOpen(true)}
+          title="Show chat history"
+          className="flex w-8 shrink-0 items-center justify-center border-r border-border text-muted-foreground hover:bg-muted/40 hover:text-foreground"
+        >
+          <PanelLeftOpen className="size-4" />
+        </button>
+      )}
 
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="flex-1 overflow-y-auto px-6 py-6">
@@ -210,8 +342,46 @@ export default function ChatPage() {
               <ChatMessage key={i} turn={turn} onViewSource={handleViewSource} />
             ))}
             {isPending && (
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="size-4 animate-spin" /> {agenticMutation.isPending ? agenticStatus : "Thinking…"}
+              // Matches ChatMessage's own avatar+bubble layout (same size-7 rounded
+              // avatar, same max-w-[80%] column) so the pending state reads as part
+              // of the conversation, not a bare status line floating below it.
+              <div className="flex gap-3">
+                <div className="flex size-7 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground">
+                  <Sparkles className="size-3.5" />
+                </div>
+                <div className="flex max-w-[80%] flex-col gap-2">
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <Loader2 className="size-4 animate-spin" /> {agenticMutation.isPending || reattaching ? agenticStatus : "Thinking…"}
+                  </div>
+                  {/* Live, updating trace (ChatGPT-reasoning-style) while an agentic
+                      turn is in progress -- open by default since watching it update
+                      in real time is the point, but genuinely collapsible (see
+                      liveTraceOpen's own comment for why this can't be a plain
+                      `<details open>`). Once the turn finishes, this is replaced by
+                      the same content attached to the completed message's own
+                      collapsed-by-default disclosure (see chat-message.tsx's
+                      pipelineTrace). */}
+                  {(agenticMutation.isPending || reattaching) && pipeline !== initialPipelineState && (
+                    <details
+                      open={liveTraceOpen}
+                      className="w-full rounded-lg border border-border/60 bg-muted/30 px-3 py-2 text-xs text-muted-foreground"
+                    >
+                      <summary
+                        onClick={(e) => {
+                          e.preventDefault();
+                          setLiveTraceOpen((v) => !v);
+                        }}
+                        className="flex cursor-pointer list-none items-center gap-1 font-medium text-foreground/80 select-none"
+                      >
+                        <ChevronRight className={cn("size-3 transition-transform", liveTraceOpen && "rotate-90")} />
+                        Reasoning trace
+                      </summary>
+                      <div className="mt-1.5">
+                        <AgentTrace state={pipeline} />
+                      </div>
+                    </details>
+                  )}
+                </div>
               </div>
             )}
             <div ref={bottomRef} />
@@ -252,6 +422,21 @@ export default function ChatPage() {
         >
           <PanelRightOpen className="size-4" />
         </button>
+      )}
+
+      {pipelinePanelOpen ? (
+        <AgentPipelinePanel state={pipeline} onCollapse={() => setPipelinePanelOpen(false)} />
+      ) : (
+        pipeline !== initialPipelineState && (
+          <button
+            type="button"
+            onClick={() => setPipelinePanelOpen(true)}
+            title="Show agent pipeline"
+            className="flex w-8 shrink-0 items-center justify-center border-l border-border text-muted-foreground hover:bg-muted/40 hover:text-foreground"
+          >
+            <PanelRightOpen className="size-4" />
+          </button>
+        )
       )}
 
       {groundingTarget && <GroundingPanel target={groundingTarget} onClose={() => setGroundingTarget(null)} />}

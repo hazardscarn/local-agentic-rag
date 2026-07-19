@@ -25,14 +25,34 @@ models:
 
   # Ollama chat model used by the contextual chunker to generate one context sentence
   # per chunk. Chosen for the 6GB VRAM budget noted in rag_vector_db_ingestion_plan.md.
-  contextual_llm: qwen3.5:2b
+  contextual_llm: qwen3.5:0.8b
 
   # Ollama chat model used by the /chat endpoint to generate an answer from retrieved
   # context. A separate key from contextual_llm on purpose -- they serve different
   # jobs (context-sentence generation at ingest time vs. answering a user's question
   # at query time) and are independently overridable from the Settings UI, even
   # though they default to the same model today for the same 6GB VRAM budget reason.
-  chat_llm: granite4.1:3b
+  chat_llm: qwen3.5:2b
+
+  # Ollama's actual runtime context window for chat_llm -- same real bug as
+  # agent.num_ctx below (see that key's comment for the full story): Ollama's
+  # request-time num_ctx silently defaults to ~2048 regardless of the model's own
+  # max supported context, so a real retrieved-context prompt (several snippets +
+  # a substantial question, easily 5000+ tokens) gets silently truncated, leaving no
+  # token budget left for the answer -- confirmed by direct reproduction, Ollama
+  # returned a completely empty completion (done_reason="length") until this was set.
+  # 32768, not a smaller value, because generate_answer() deliberately keeps a
+  # thinking-capable model's reasoning ON (see that function's docstring): a real
+  # side-by-side test on a compound, partially-unanswerable question showed thinking
+  # ON correctly refused ("the context doesn't cover this") where thinking OFF
+  # fabricated a fictional legal citation instead -- grounded refusal over confident
+  # hallucination. That reasoning pass itself can run several thousand tokens on top
+  # of the prompt, so num_ctx needs real headroom for it, not just the prompt alone
+  # (confirmed: prompt+reasoning+answer used ~13,500 tokens on one real compound
+  # question against a 2B model). Raise further only alongside confirming VRAM
+  # headroom (GET /system/info) if needed; a 2-3B chat model's KV cache at this size
+  # is much lighter than agent.num_ctx's 4B-model budget below.
+  chat_num_ctx: 32768
 
   # Ollama vision-capable model used by Docling's picture-description enrichment
   # (do_picture_description) to caption retained images at extraction time. Small on
@@ -50,18 +70,17 @@ models:
   reranker: Xenova/ms-marco-MiniLM-L-6-v2
 
 agent:
-  # Ollama chat model driving the agentic RAG loop (edenview_RAG/agentic_rag) --
-  # a separate key from models.chat_llm since Simple RAG and Agentic RAG are
-  # independently overridable modes. MUST be tool-calling-capable; image-inspection
-  # in the "high" effort tier additionally requires a vision-capable model, checked
-  # at runtime via `ollama show <model>`'s reported `capabilities` list rather than
-  # assumed -- if the configured model isn't multimodal, the image-inspection tool
-  # is simply not registered (no error, just that one capability silently
-  # unavailable). qwen3.5:2b is confirmed vision+tools+thinking-capable and already
-  # pulled; qwen3.5:4b is a same-family drop-in upgrade once pulled. Note: running
-  # a *different* model here than models.chat_llm means both can end up
-  # Ollama-resident at once if a user swaps between Simple/Agentic mode within one
-  # keep_alive window -- fine on this 6GB budget alongside bge-m3, but worth knowing.
+  # Ollama chat model driving every LLM node of the agentic RAG pipeline
+  # (edenview_RAG/agentic_rag: reworder, search_executor, eval, deep_search,
+  # answer_formatter, root) -- a separate key from models.chat_llm since Simple RAG
+  # and Agentic RAG are independently overridable modes. MUST be tool-calling-capable
+  # -- checked at runtime via `ollama show <model>`'s reported `capabilities` list
+  # (require_tool_calling_model()), not assumed; the agent fails to build at all,
+  # loudly, if this model can't tool-call, since there's no reasonable degraded mode
+  # for a tool-calling design without tool-calling. Note: running a *different*
+  # model here than models.chat_llm means both can end up Ollama-resident at once if
+  # a user swaps between Simple/Agentic mode within one keep_alive window -- fine on
+  # this 6GB budget alongside bge-m3, but worth knowing.
   model: qwen3.5:4b
   # Ollama's actual runtime context window for this model -- NOT the same as the
   # model's own max supported context (qwen3.5:4b supports up to 262144, but Ollama's
@@ -73,28 +92,44 @@ agent:
   # hallucination/poor grounding until this was traced to its real cause. Same
   # category of bug as vectorstore/embedding.py's num_batch=4096 fix for bge-m3 --
   # Ollama's own default doesn't scale with what the model or the request actually
-  # needs. Briefly bumped to 32768 to chase a "medium" tier issue that turned out to
-  # be a different bug (subagent.py's critic/answer steps carrying unnecessary full
-  # conversation history -- fixed via include_contents="none" on those two, see their
-  # docstrings) -- reverted back down after confirming a large num_ctx causes its own
-  # real problem on this 6GB GPU: Ollama reserves KV cache for the FULL requested
-  # num_ctx upfront regardless of actual prompt length, and 32768 pushed the
-  # model+cache past VRAM, causing CPU-offload slowdowns severe enough to blow a
-  # 600s timeout on calls that used to complete in seconds. 16384 is the confirmed-
-  # working value for a real single-shot retrieved-context prompt (low tier); raise
-  # only alongside confirming VRAM headroom (see GET /system/info) if a higher
-  # top_k/larger chunks/more max_iterations genuinely need more.
-  num_ctx: 16384
-  # Which of the three pre-built agent trees (low/medium/high) a request uses when
-  # not explicitly specified -- see edenview_RAG/agentic_rag for what each tier does.
-  default_effort: high
-  # Hard cap on the critic/refiner refinement loop's iterations per tier -- the loop
-  # is expected to usually exit early (the critic signals satisfaction), this is
-  # just the ceiling so a weak local model can't get stuck looping forever. "low"
-  # has no loop at all (single retrieve-then-answer), so it isn't listed here.
-  max_iterations:
-    medium: 2
-    high: 4
+  # needs. A too-large num_ctx has its own real cost on a 6GB GPU: Ollama reserves
+  # KV cache for the FULL requested num_ctx upfront regardless of actual prompt
+  # length, and 32768 once pushed a 4B model+cache past VRAM, causing CPU-offload
+  # slowdowns severe enough to blow a 600s timeout on calls that used to complete in
+  # seconds -- raised back to 32768 here since that same headroom is also what fixed
+  # a separate, confirmed real bug: answer_formatter's one num_ctx budget has to fit
+  # a multi-part question's consolidated notes AND the final answer together, and
+  # 16384 wasn't enough -- a real answer was observed cut off mid-generation on a
+  # two-part question. answer_formatter's own thinking pass was also disabled
+  # (agent.py, get_reword_llm() instead of get_shared_llm()) as the first, VRAM-free
+  # lever on the same problem -- 32768 is the second, together giving real headroom
+  # rather than relying on either alone. If this reproduces the earlier CPU-offload
+  # timeout on a given machine, check actual VRAM headroom via GET /system/info
+  # before assuming it's the same fix landing wrong -- this value was tuned against a
+  # 6GB GPU, a machine with less headroom may need to drop back down.
+  num_ctx: 32768
+  # Optional, independently-settable Ollama vision model used ONLY inside
+  # get_answer_from_images's direct-ollama call (edenview_RAG/agentic_rag/tools.py)
+  # -- deliberately NOT required to be the same model as `agent.model` above, since a
+  # user with more VRAM headroom may want a dedicated vision model resident
+  # alongside the main tool-calling model. null (default) means "reuse `agent.model`
+  # if it's vision-capable, else that one capability is silently unavailable" -- the
+  # same safe-by-default behavior as everything else here. Setting this to a
+  # DIFFERENT model than `agent.model` means both can be Ollama-resident at once
+  # within a single turn (Deep Search calling `agent.model` for tool-calling AND
+  # `vision_model` for one image sub-question) -- not blocked, but worth knowing on
+  # a constrained VRAM budget; GET /system/info reports available VRAM if you want
+  # to check before committing to two resident models.
+  vision_model:
+  # Hard cap on the refinement loop's iterations -- the loop is expected to usually
+  # exit early (Eval signals sufficient), this is just the ceiling so a weak local
+  # model can't get stuck looping forever. 3, not 4: each iteration already runs a
+  # full reword+search+eval+deep_search cycle, so by iteration 2 the loop has already
+  # re-worded once AND dug deeper once -- a 3rd iteration is a reasonable safety
+  # margin beyond that; a real test run that never reached `sufficient` burned an
+  # entire additional ~106s on a 4th iteration without resolving anything (see
+  # test/agentic_rag/verify_live_status.py), so 4 was more headroom than useful.
+  max_iterations: 3
 
 ollama:
   host: http://localhost:11434
@@ -139,14 +174,14 @@ workspace:
 performance:
   # Threads Docling's own pipeline uses per extraction. null = cpu_count - 2 (min 1),
   # leaving headroom for the OS/other apps -- set an explicit number to override.
-  num_threads: null
+  num_threads:
   # Pages of a single document Docling batches together internally -- a process-wide
   # Docling setting (not per-document), its own default is 4. null = that default.
-  page_batch_size: null
+  page_batch_size:
   # How many documents can run extraction (model loading + inference -- the actual
   # resource-hungry step) at the same time. null = 4. Confirmed necessary by
   # reproduction: ingesting many files at once with no limit ran every extraction
   # simultaneously, oversubscribing CPU threads, RAM, and a shared GPU badly enough
   # that the whole batch was far slower than a few at a time would have been.
   # Requires a backend restart to take effect.
-  max_concurrent_extractions: null
+  max_concurrent_extractions:

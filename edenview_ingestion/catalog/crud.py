@@ -479,6 +479,39 @@ def complete_job(
         )
 
 
+# The two states a live server can leave a job row in mid-work (see create_job()/
+# start_job() above -- the only code that ever writes these two values). A "queued"/
+# "running" row with no process actually working on it (the backend crashed, was
+# force-killed, or was restarted mid-job -- there's no --reload, so a Python change
+# always means a full restart, see edenview-ui/package.json's dev:backend script) is
+# stuck there forever otherwise, since nothing else ever calls complete_job() for it.
+STALE_JOB_STATUSES = ["queued", "running"]
+
+
+def clear_stale_jobs(connection: duckdb.DuckDBPyConnection = None) -> list[IngestionJobRecord]:
+    """Marks every "queued"/"running" job as "error" via the same complete_job() a
+    real ingestion run uses to close out a job normally -- not raw SQL, so this stays
+    correct if this table's schema ever changes. Returns the jobs it cleared (their
+    pre-clear state, for a caller to report what happened) -- safe to call any time,
+    including with nothing actually running (e.g. from scripts/fresh_start.py, or a
+    fresh server startup), since an empty result just means nothing was stale.
+    Single source of truth for both that maintenance script and the
+    POST /system/jobs/clear-stale API route -- do not duplicate this logic."""
+    connection = connection or get_connection()
+    stale = list_jobs(limit=10000, statuses=STALE_JOB_STATUSES, connection=connection)
+    for job in stale:
+        complete_job(
+            job.job_id,
+            status="error",
+            error_message=(
+                "Cleared as a stale job -- the server was restarted or crashed while "
+                "this job was in progress."
+            ),
+            connection=connection,
+        )
+    return stale
+
+
 # --- parent_chunks -------------------------------------------------------------------
 # "parent" kind Chunks from the parent_child strategy -- never embedded, looked up here
 # at query time when a matched "child" chunk's parent_id needs swapping in.

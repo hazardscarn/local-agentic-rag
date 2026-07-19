@@ -5,10 +5,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   browseWorkspaceFolder,
+  clearStaleJobs,
   getModelSettings,
+  getOllamaModelsWithCapabilities,
   getPerformanceSettings,
   getSystemInfo,
   getWorkspaceSettings,
+  unloadAllOllamaModels,
   updateModelSettings,
   updatePerformanceSettings,
   updateWorkspace,
@@ -19,9 +22,11 @@ import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import { ModelField } from "@/components/settings/model-field";
+import { AgentModelSelect } from "@/components/settings/agent-model-select";
 import { FieldHelp } from "@/components/shared/field-help";
-import { Loader2, Cpu, MemoryStick, MonitorCog, TriangleAlert, FolderCog, FolderOpen, Gauge } from "lucide-react";
+import { Loader2, Cpu, MemoryStick, MonitorCog, TriangleAlert, FolderCog, FolderOpen, Gauge, Bot, Eraser } from "lucide-react";
 
 export default function SettingsPage() {
   const queryClient = useQueryClient();
@@ -29,6 +34,9 @@ export default function SettingsPage() {
   const { data: settings, isLoading } = useQuery({ queryKey: ["model-settings"], queryFn: getModelSettings });
   const { data: workspace } = useQuery({ queryKey: ["workspace-settings"], queryFn: getWorkspaceSettings });
   const { data: performance } = useQuery({ queryKey: ["performance-settings"], queryFn: getPerformanceSettings });
+  // Separate from system-info -- see getOllamaModelsWithCapabilities()'s own comment
+  // for why this isn't folded into the frequently-polled GET /system/info instead.
+  const { data: capModels } = useQuery({ queryKey: ["ollama-models-capabilities"], queryFn: getOllamaModelsWithCapabilities });
 
   const [form, setForm] = useState<ModelSettings | null>(null);
   const [workspaceRoot, setWorkspaceRoot] = useState("");
@@ -90,6 +98,42 @@ export default function SettingsPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["performance-settings"] });
       toast.warning("Saved. Extraction threads/page batch size apply to the next ingestion — max concurrent extractions needs an API server restart.");
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  // Marks any ingestion job left "queued"/"running" by a crashed/restarted backend
+  // as "error" -- only touches job status rows, never real documents/collections/
+  // chat data. Shares its backend logic with scripts/fresh_start.py.
+  const clearStaleJobsMutation = useMutation({
+    mutationFn: clearStaleJobs,
+    onSuccess: (res) => {
+      if (res.cleared_count === 0) {
+        toast.success("No stale jobs found — already clean.");
+        return;
+      }
+      toast.success(
+        `Cleared ${res.cleared_count} stale job${res.cleared_count > 1 ? "s" : ""}: ${res.cleared_filenames.join(", ")}`,
+      );
+      queryClient.invalidateQueries({ queryKey: ["jobs"] });
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
+  // Evicts every Ollama model currently loaded (embedding, chat, contextual chunking,
+  // picture description, agent) to free RAM/VRAM in one call -- the bulk counterpart
+  // to unloading one model at a time from the sidebar's system monitor. Doesn't
+  // interrupt a call actively streaming right now (Ollama has no cancel endpoint) --
+  // it only reclaims memory a model is holding idle.
+  const unloadAllMutation = useMutation({
+    mutationFn: unloadAllOllamaModels,
+    onSuccess: (res) => {
+      if (res.models_unloaded.length === 0) {
+        toast.success("No models were loaded — already clean.");
+        return;
+      }
+      toast.success(`Unloaded ${res.models_unloaded.length} model${res.models_unloaded.length > 1 ? "s" : ""}: ${res.models_unloaded.join(", ")}`);
+      queryClient.invalidateQueries({ queryKey: ["system-live"] });
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -368,6 +412,57 @@ export default function SettingsPage() {
 
       <Card>
         <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <Bot className="size-4" /> Agentic RAG
+          </CardTitle>
+          <CardDescription>
+            The model driving the agentic pipeline&apos;s reword/search/eval/deep-search loop -- separate
+            from the chat model above, since Simple RAG and Agentic RAG are independently configurable.
+            Different hardware can run different models here; the dropdowns only list pulled models that
+            actually report the capability each field needs.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-5">
+          <AgentModelSelect
+            settingKey="agent_model"
+            label="Agent model (must support tool-calling)"
+            capability="tools"
+            value={form.agent_model}
+            onChange={(v) => set("agent_model", v)}
+            models={capModels ?? []}
+          />
+          <AgentModelSelect
+            settingKey="agent_vision_model"
+            label="Agent vision model"
+            capability="vision"
+            value={form.agent_vision_model ?? ""}
+            onChange={(v) => set("agent_vision_model", v || null)}
+            models={capModels ?? []}
+            allowUnset
+            unsetLabel="Use agent model's vision, if supported"
+          />
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center gap-2">
+              <Label>Max refinement iterations</Label>
+              <Badge variant="secondary" className="text-[10px]">restart required</Badge>
+            </div>
+            <Input
+              type="number"
+              min={1}
+              value={form.agent_max_iterations}
+              onChange={(e) => set("agent_max_iterations", Number(e.target.value) || 1)}
+            />
+            <p className="text-xs text-muted-foreground">
+              How many reword/search/eval passes one sub-question&apos;s research loop can take before
+              giving up. The loop usually exits early once the eval step says the findings are enough --
+              this is just the ceiling.
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
           <CardTitle className="text-sm">Connection</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-5">
@@ -389,6 +484,51 @@ export default function SettingsPage() {
               onChange={(e) => set("ollama_keep_alive", e.target.value)}
               placeholder="30m"
             />
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-sm">
+            <Eraser className="size-4" /> Maintenance
+          </CardTitle>
+          <CardDescription>
+            Clears any ingestion job left &quot;queued&quot;/&quot;running&quot; by a backend that crashed or
+            was restarted mid-job — nothing else ever marks those rows finished once their process is gone.
+            Only touches job status rows, never real documents/collections/chat data.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-4">
+          <Button
+            variant="secondary"
+            disabled={clearStaleJobsMutation.isPending}
+            onClick={() => clearStaleJobsMutation.mutate()}
+            className="w-fit"
+          >
+            {clearStaleJobsMutation.isPending && <Loader2 className="size-4 animate-spin" />}
+            Clear stale ingestion jobs
+          </Button>
+
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center gap-1.5">
+              <Button
+                variant="secondary"
+                disabled={unloadAllMutation.isPending}
+                onClick={() => unloadAllMutation.mutate()}
+                className="w-fit"
+              >
+                {unloadAllMutation.isPending && <Loader2 className="size-4 animate-spin" />}
+                Unload all Ollama models (free VRAM)
+              </Button>
+              <FieldHelp>
+                Evicts every currently-loaded Ollama model — embedding, chat, contextual chunking, picture
+                description, agent — from RAM/VRAM right away, instead of waiting on each one&apos;s idle
+                timeout. Doesn&apos;t interrupt a call that&apos;s actively generating right now (Ollama has
+                no way to cancel one mid-flight) — that finishes on its own; this only frees memory models
+                are holding while idle.
+              </FieldHelp>
+            </div>
           </div>
         </CardContent>
       </Card>

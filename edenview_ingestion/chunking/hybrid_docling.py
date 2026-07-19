@@ -15,6 +15,7 @@ from edenview_ingestion.docling_parsing import ExtractionBundle
 
 from ._linking import attach_images
 from ._provenance import first_item_provenance
+from ._table_serializer import MarkdownTableSerializerProvider
 from ._tokenizer import get_tokenizer
 from .config import HybridDoclingConfig
 from .models import Chunk, make_chunk_id
@@ -24,7 +25,13 @@ STRATEGY = "hybrid_docling"
 
 def chunk(bundle: ExtractionBundle, config: HybridDoclingConfig = HybridDoclingConfig()) -> list[Chunk]:
     tokenizer = get_tokenizer(config.tokenizer_model, config.max_tokens)
-    chunker = HybridChunker(tokenizer=tokenizer, merge_peers=config.merge_peers)
+    # serializer_provider=MarkdownTableSerializerProvider() -- see that module's
+    # docstring: Docling's own default table serializer here separates a table's
+    # header row from its data, confirmed to produce chunk text where real numbers
+    # survive but which year/column they belong to doesn't.
+    chunker = HybridChunker(
+        tokenizer=tokenizer, merge_peers=config.merge_peers, serializer_provider=MarkdownTableSerializerProvider()
+    )
 
     chunks: list[Chunk] = []
     for i, doc_chunk in enumerate(chunker.chunk(bundle.document)):

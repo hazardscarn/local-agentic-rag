@@ -234,3 +234,42 @@ test/chunking/cache/
 # data, instance-specific, never committed -- same reasoning as qdrant_db/ above.
 edenview_data/
 data/
+
+# ADK's local SQLite session store (edenview_RAG/agentic_rag's DatabaseSessionService,
+# see edenview_progress.md) -- per-machine conversation state, not source.
+edenview_RAG/agentic_rag/.adk/
+
+# Ad-hoc debug/run output left at the project root during development (e.g. a captured
+# final-answer dump, a run log) -- not something a package install needs.
+final_answer_dump.txt
+*_dump.txt
+s1_run.log
+
+# test/agentic_rag/verify_agentic_rag.py's own scratch state between its two-phase
+# (separate-process) run -- the verify script itself IS committed, this file is its
+# throwaway working state.
+test/agentic_rag/.verify_session_id.tmp
+
+# Personal scratch/experiment folders -- one-off notebooks and dev-sandbox copies of
+# package modules used while iterating, never part of the shipped app (contrast with
+# docling_exp/, which holds committed extraction-format exploration output on purpose).
+adhoc/
+agent_dev/
+
+# Claude Code's local, per-machine settings (permissions etc.) -- machine-specific,
+# not meant to be shared via the repo. A checked-in .claude/settings.json (if ever
+# added) would be the shared counterpart and should stay tracked.
+.claude/settings.local.json
+.claude/
+
+edenview_plan.md
+edenview_progress.md
+rag_vector_db_ingestion_plan.md
+rules.md
+
+ingest/
+query/
+cache/
+data/
+docling_exp/
+documentations/

@@ -22,6 +22,7 @@ from edenview_ingestion.docling_parsing import ExtractionBundle
 
 from ._linking import attach_images
 from ._provenance import first_item_provenance
+from ._table_serializer import MarkdownTableSerializerProvider
 from ._tokenizer import get_tokenizer
 from .config import ParentChildConfig
 from .models import Chunk, make_chunk_id
@@ -50,7 +51,9 @@ def _group_into_parents(doc_chunks, tokenizer, parent_max_tokens: int) -> list[l
 
 def chunk(bundle: ExtractionBundle, config: ParentChildConfig = ParentChildConfig()) -> list[Chunk]:
     tokenizer = get_tokenizer(config.tokenizer_model, config.child_max_tokens)
-    chunker = HybridChunker(tokenizer=tokenizer)
+    # serializer_provider=MarkdownTableSerializerProvider() -- see that module's
+    # docstring, same reasoning as hybrid_docling.py's identical change.
+    chunker = HybridChunker(tokenizer=tokenizer, serializer_provider=MarkdownTableSerializerProvider())
 
     child_doc_chunks = list(chunker.chunk(bundle.document))
     groups = _group_into_parents(child_doc_chunks, tokenizer, config.parent_max_tokens)

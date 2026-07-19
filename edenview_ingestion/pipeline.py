@@ -150,9 +150,25 @@ def _get_or_create_collection(db_name: str, qdrant_collection_name: str, strateg
     finish creating it, and every loser hits DuplicateNameError against the
     collections table's UNIQUE constraint. That only means "a sibling request in
     this same batch just created the exact row we wanted", so fetch and return it
-    instead of failing that file's ingest outright."""
+    instead of failing that file's ingest outright.
+
+    Also enforces that every ingest into an already-existing collection uses the
+    SAME chunking_strategy it was created with. Confirmed by direct reproduction
+    that silently allowing a mismatch (this function's previous behavior) lets a
+    collection's catalog row keep whichever strategy created it first while its
+    actual Qdrant points quietly become a mix of incompatible chunk shapes (e.g. a
+    collection created hybrid_docling, later also ingested with parent_child and
+    recursive_overlap) -- this breaks search()'s own `strategy` filter (it only
+    ever sees the stale catalog value, so it wrongly excludes the whole collection
+    for any strategy other than the first one used) and degrades retrieval by
+    letting RRF fusion/reranking merge fundamentally different chunk granularities
+    with no way to separate them again. Raises ValueError (same pattern as this
+    module's other request-shape validation, e.g. prepare_ingest's unknown-strategy
+    check) rather than silently proceeding -- callers that hit this should either
+    use a different collection_name for the new strategy, or keep ingesting into
+    this one with the strategy it already has."""
     try:
-        return catalog.crud.get_collection(qdrant_collection_name)
+        collection = catalog.crud.get_collection(qdrant_collection_name)
     except catalog.NotFoundError:
         try:
             return catalog.crud.create_collection(
@@ -170,7 +186,18 @@ def _get_or_create_collection(db_name: str, qdrant_collection_name: str, strateg
                 status="ingesting",
             )
         except catalog.DuplicateNameError:
-            return catalog.crud.get_collection(qdrant_collection_name)
+            collection = catalog.crud.get_collection(qdrant_collection_name)
+
+    if collection.chunking_strategy != strategy:
+        raise ValueError(
+            f"Collection {qdrant_collection_name!r} already exists with chunking_strategy "
+            f"{collection.chunking_strategy!r} -- ingesting with a different strategy "
+            f"({strategy!r}) into the same collection would silently mix incompatible chunk "
+            "shapes in one Qdrant collection, breaking the `strategy` search filter and "
+            f"degrading retrieval quality. Use a different collection_name for {strategy!r}, "
+            f"or keep using {collection.chunking_strategy!r} for this one."
+        )
+    return collection
 
 
 def prepare_ingest(

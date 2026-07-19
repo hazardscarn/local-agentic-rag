@@ -10,6 +10,7 @@ import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Combobox } from "@/components/ui/combobox";
+import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { FieldHelp } from "@/components/shared/field-help";
@@ -42,11 +43,27 @@ export function IngestForm() {
 
   const [dbName, setDbName] = useState("");
   const [collectionName, setCollectionName] = useState("");
-  const [strategy, setStrategy] = useState("recursive_overlap");
+  const [strategy, setStrategy] = useState("hybrid_docling");
   const [includeImageDescriptions, setIncludeImageDescriptions] = useState(false);
   const [forceFullPageOcr, setForceFullPageOcr] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
   const [dragActive, setDragActive] = useState(false);
+
+  // Size knobs only recursive_overlap and parent_child expose -- hybrid_docling and
+  // contextual derive their token budget from the tokenizer/embedding model instead
+  // (see edenview_ingestion/chunking/config.py), so there's nothing to tune there.
+  // Defaults mirror RecursiveOverlapConfig/ParentChildConfig's own Python defaults.
+  const [chunkSize, setChunkSize] = useState("512");
+  const [chunkOverlap, setChunkOverlap] = useState("50");
+  const [childMaxTokens, setChildMaxTokens] = useState("180");
+  const [parentMaxTokens, setParentMaxTokens] = useState("2000");
+
+  const sizeConfigValid =
+    strategy === "recursive_overlap"
+      ? Number(chunkSize) > 0 && Number(chunkOverlap) >= 0 && Number(chunkOverlap) < Number(chunkSize)
+      : strategy === "parent_child"
+        ? Number(childMaxTokens) > 0 && Number(childMaxTokens) < Number(parentMaxTokens)
+        : true;
 
   const { data: dbs } = useQuery({ queryKey: ["dbs"], queryFn: listDbs });
   const { data: collections } = useQuery({ queryKey: ["collections", "all"], queryFn: () => listCollections() });
@@ -83,6 +100,13 @@ export function IngestForm() {
           form.append("strategy", strategy);
           form.append("include_image_descriptions", String(includeImageDescriptions));
           form.append("force_full_page_ocr", String(forceFullPageOcr));
+          if (strategy === "recursive_overlap") {
+            form.append("chunk_size", chunkSize);
+            form.append("chunk_overlap", chunkOverlap);
+          } else if (strategy === "parent_child") {
+            form.append("child_max_tokens", childMaxTokens);
+            form.append("parent_max_tokens", parentMaxTokens);
+          }
           try {
             await ingestFile(form);
             return { file, ok: true };
@@ -115,7 +139,8 @@ export function IngestForm() {
     },
   });
 
-  const canSubmit = dbName.trim() && collectionName.trim() && strategy && files.length > 0 && !mutation.isPending;
+  const canSubmit =
+    dbName.trim() && collectionName.trim() && strategy && files.length > 0 && !mutation.isPending && sizeConfigValid;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -257,7 +282,7 @@ export function IngestForm() {
                   <Label>Chunking strategy</Label>
                   <FieldHelp>{STRATEGY_HELP[strategy] ?? "Choose how this document gets split into chunks."}</FieldHelp>
                 </div>
-                <Select value={strategy} onValueChange={(v) => setStrategy(v ?? "recursive_overlap")}>
+                <Select value={strategy} onValueChange={(v) => setStrategy(v ?? "hybrid_docling")}>
                   <SelectTrigger>
                     <SelectValue placeholder="Choose a strategy" />
                   </SelectTrigger>
@@ -309,6 +334,99 @@ export function IngestForm() {
                 </div>
               </div>
             </div>
+
+            {strategy === "recursive_overlap" && (
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <Label htmlFor="chunk-size">Chunk size (characters)</Label>
+                    <FieldHelp>
+                      Target length of each chunk before the splitter falls back through
+                      paragraph, sentence, word, then character boundaries. Larger chunks
+                      carry more context per match but are less precise; smaller chunks
+                      are the opposite. Default 512.
+                    </FieldHelp>
+                  </div>
+                  <Input
+                    id="chunk-size"
+                    type="number"
+                    min={1}
+                    value={chunkSize}
+                    onChange={(e) => setChunkSize(e.target.value)}
+                    aria-invalid={!sizeConfigValid}
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <Label htmlFor="chunk-overlap">Chunk overlap (characters)</Label>
+                    <FieldHelp>
+                      How many characters consecutive chunks share, so content near a
+                      chunk boundary isn't lost from either side. Must be smaller than
+                      chunk size. Default 50.
+                    </FieldHelp>
+                  </div>
+                  <Input
+                    id="chunk-overlap"
+                    type="number"
+                    min={0}
+                    value={chunkOverlap}
+                    onChange={(e) => setChunkOverlap(e.target.value)}
+                    aria-invalid={!sizeConfigValid}
+                  />
+                </div>
+                {!sizeConfigValid && (
+                  <p className="text-xs text-destructive sm:col-span-2">
+                    Chunk overlap must be smaller than chunk size.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {strategy === "parent_child" && (
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <Label htmlFor="child-max-tokens">Child chunk size (tokens)</Label>
+                    <FieldHelp>
+                      Token budget for each searchable "child" chunk -- smaller means
+                      more precise matches. Must be smaller than the parent chunk size.
+                      Default 180.
+                    </FieldHelp>
+                  </div>
+                  <Input
+                    id="child-max-tokens"
+                    type="number"
+                    min={1}
+                    value={childMaxTokens}
+                    onChange={(e) => setChildMaxTokens(e.target.value)}
+                    aria-invalid={!sizeConfigValid}
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <Label htmlFor="parent-max-tokens">Parent chunk size (tokens)</Label>
+                    <FieldHelp>
+                      Token budget for the larger "parent" context handed to the LLM once
+                      one of its children matches. Must be larger than the child chunk
+                      size. Default 2000.
+                    </FieldHelp>
+                  </div>
+                  <Input
+                    id="parent-max-tokens"
+                    type="number"
+                    min={1}
+                    value={parentMaxTokens}
+                    onChange={(e) => setParentMaxTokens(e.target.value)}
+                    aria-invalid={!sizeConfigValid}
+                  />
+                </div>
+                {!sizeConfigValid && (
+                  <p className="text-xs text-destructive sm:col-span-2">
+                    Child chunk size must be smaller than parent chunk size.
+                  </p>
+                )}
+              </div>
+            )}
 
             <Button type="submit" disabled={!canSubmit} className="w-fit">
               {mutation.isPending && <Loader2 className="size-4 animate-spin" />}

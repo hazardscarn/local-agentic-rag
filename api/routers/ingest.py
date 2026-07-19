@@ -12,13 +12,47 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from pydantic import ValidationError
 
 from edenview_ingestion import catalog, pipeline
-from edenview_ingestion.chunking import CHUNKERS
+from edenview_ingestion.chunking import CHUNKERS, ParentChildConfig, RecursiveOverlapConfig
 
 from ..schemas import IngestAccepted
 
 router = APIRouter(tags=["ingest"])
+
+
+def _build_chunk_config(
+    strategy: str,
+    chunk_size: Optional[int],
+    chunk_overlap: Optional[int],
+    child_max_tokens: Optional[int],
+    parent_max_tokens: Optional[int],
+):
+    """Only recursive_overlap and parent_child take a size override here --
+    hybrid_docling and contextual derive their token budget from the tokenizer/embedding
+    model instead (see chunking/config.py's DEFAULT_TOKENIZER_MODEL docstring), so an
+    override there would disconnect chunk sizing from what the embedder actually sees.
+    Raises HTTPException(400) if the values fail the config's own validation (e.g.
+    overlap >= size)."""
+    try:
+        if strategy == "recursive_overlap":
+            kwargs = {}
+            if chunk_size is not None:
+                kwargs["chunk_size"] = chunk_size
+            if chunk_overlap is not None:
+                kwargs["chunk_overlap"] = chunk_overlap
+            return RecursiveOverlapConfig(**kwargs) if kwargs else None
+        if strategy == "parent_child":
+            kwargs = {}
+            if child_max_tokens is not None:
+                kwargs["child_max_tokens"] = child_max_tokens
+            if parent_max_tokens is not None:
+                kwargs["parent_max_tokens"] = parent_max_tokens
+            return ParentChildConfig(**kwargs) if kwargs else None
+        return None
+    except ValidationError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 def _run_ingest_background(
@@ -26,6 +60,7 @@ def _run_ingest_background(
     db_name: str,
     collection_name: str,
     strategy: str,
+    chunk_config,
     include_image_descriptions: bool,
     force_full_page_ocr: bool,
     job_id: str,
@@ -36,6 +71,7 @@ def _run_ingest_background(
             db_name,
             collection_name,
             strategy,
+            chunk_config=chunk_config,
             include_image_descriptions=include_image_descriptions,
             force_full_page_ocr=force_full_page_ocr,
             job_id=job_id,
@@ -53,22 +89,33 @@ def ingest(
     strategy: str = Form(...),
     include_image_descriptions: bool = Form(False),
     force_full_page_ocr: bool = Form(False),
+    chunk_size: Optional[int] = Form(None),
+    chunk_overlap: Optional[int] = Form(None),
+    child_max_tokens: Optional[int] = Form(None),
+    parent_max_tokens: Optional[int] = Form(None),
 ):
     if strategy not in CHUNKERS:
         raise HTTPException(400, f"Unknown strategy {strategy!r}. Available: {list(CHUNKERS)}")
+
+    chunk_config = _build_chunk_config(strategy, chunk_size, chunk_overlap, child_max_tokens, parent_max_tokens)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="edenview_upload_"))
     tmp_path = tmp_dir / file.filename
     with open(tmp_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    job = pipeline.prepare_ingest(db_name, collection_name, strategy, filename=file.filename)
+    try:
+        job = pipeline.prepare_ingest(db_name, collection_name, strategy, filename=file.filename)
+    except ValueError as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(400, str(e)) from e
     background_tasks.add_task(
         _run_ingest_background,
         tmp_path,
         db_name,
         collection_name,
         strategy,
+        chunk_config,
         include_image_descriptions,
         force_full_page_ocr,
         job.job_id,

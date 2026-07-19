@@ -34,6 +34,13 @@ RESTART_REQUIRED_KEYS = {
     "contextual_llm",
     "picture_description_llm",
     "reranker",
+    # agent_* always need a restart, unconditionally -- unlike chat_llm (read fresh
+    # per /chat call), edenview_RAG.agentic_rag.config's get_shared_llm()/
+    # get_reword_llm() are @lru_cache(maxsize=1) singletons and
+    # require_tool_calling_model() runs once at agent.py's own module import time.
+    "agent_model",
+    "agent_vision_model",
+    "agent_max_iterations",
 }
 
 
@@ -62,6 +69,23 @@ def update_config(body: UpdateModelSettingsRequest):
             raise HTTPException(
                 400, f"Could not reach Ollama to detect {updates['dense_embedding']!r}'s dimension: {e}"
             ) from e
+
+    # agent_model has no reasonable degraded mode (same reasoning as
+    # edenview_RAG.agentic_rag.config.require_tool_calling_model(), which this
+    # mirrors) -- reject it here, at save time, rather than letting the user save a
+    # config that only fails loudly on the next restart. agent_vision_model is
+    # deliberately NOT validated the same way -- get_vision_model() already treats a
+    # non-vision model as "that one capability is silently unavailable", a graceful
+    # degradation, not a hard requirement.
+    if "agent_model" in updates:
+        host = updates.get("ollama_host", settings.get_ollama_host())
+        if not settings.model_supports_capability(updates["agent_model"], "tools", host):
+            raise HTTPException(
+                400,
+                f"{updates['agent_model']!r} does not report tool-calling support "
+                "(checked via `ollama show`) -- the agentic RAG pipeline requires a "
+                "tool-calling-capable model. Pick a different one.",
+            )
 
     try:
         updated = settings.update_model_settings(updates)

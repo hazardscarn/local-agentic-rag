@@ -32,11 +32,17 @@ matplotlib==3.11.0
 
 # edenview_RAG/agentic_rag -- ADK-based agentic RAG loop (Simple RAG's chat_llm above
 # is unaffected; this powers the separate "Agentic RAG" chat mode).
-# litellm pinned to 1.77.7 specifically: pip's default resolution (1.92.0 at time of
-# writing) has no prebuilt wheel and falls back to a source build that requires a
-# Rust/Cargo toolchain not set up on this machine -- 1.77.7 has a plain py3-none-any
-# wheel and installs cleanly. Re-check wheel availability before bumping this pin.
+# litellm pinned to 1.84.0: confirmed a plain py3-none-any wheel (no Rust/Cargo build
+# needed -- verified via `pip download --no-deps`), fixes two real upstream bugs this
+# project previously worked around with runtime monkeypatches (an ollama reasoning-
+# content KeyError, and an ollama image data-URI/base64 bug -- see
+# edenview_RAG/agentic_rag/tools.py's get_answer_from_images and config.py's
+# _register_ollama_model_with_litellm for what's still needed vs. what this version
+# fixed outright), and clears google-adk==2.5.0's own documented litellm>=1.84 floor
+# for its optional extras. `pip download litellm` (unpinned/latest) currently fails
+# with metadata-generation-failed -- re-verify wheel availability directly before
+# bumping this pin again, don't assume.
 google-adk==2.5.0
-litellm==1.77.7
+litellm==1.84.0
 sqlalchemy==2.0.51
 aiosqlite==0.22.1
