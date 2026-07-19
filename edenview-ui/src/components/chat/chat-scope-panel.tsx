@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
 import { getModelSettings, getSystemInfo, listChunkingStrategies, listCollections, listDbs } from "@/lib/api";
@@ -44,6 +44,28 @@ export function ChatScopePanel({
   const { data: system } = useQuery({ queryKey: ["system-info"], queryFn: getSystemInfo });
   const { data: modelSettings } = useQuery({ queryKey: ["model-settings"], queryFn: getModelSettings });
   const [expandedDbIds, setExpandedDbIds] = useState<Set<string>>(new Set());
+
+  // Self-heals scope.collectionNames against whatever collections this backend
+  // actually reports, dropping anything stale. `collectionNames` is persisted to
+  // localStorage keyed only by browser origin (see chat/page.tsx), so it survives
+  // across completely different on-disk installs/workspaces that happen to be served
+  // from the same http://localhost:3000 -- a name selected against one install can
+  // otherwise silently ride along into another. It's also the right fix for a more
+  // ordinary case: a collection you'd previously selected gets deleted later. Either
+  // way, a name with no matching collection can never be a real, queryable one --
+  // search()/chat would otherwise send it straight through and the backend has no
+  // way to distinguish "stale" from "real" on its own. Only prunes once `collections`
+  // has actually loaded (undefined during the initial fetch), so this never wipes a
+  // valid selection just because the query hasn't resolved yet.
+  useEffect(() => {
+    if (!collections) return;
+    const validNames = new Set(collections.map((c) => c.qdrant_collection_name));
+    const pruned = scope.collectionNames.filter((n) => validNames.has(n));
+    if (pruned.length !== scope.collectionNames.length) {
+      onChange({ ...scope, collectionNames: pruned });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [collections]);
 
   const set = <K extends keyof ChatScope>(key: K, value: ChatScope[K]) => onChange({ ...scope, [key]: value });
 

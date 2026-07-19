@@ -83,7 +83,19 @@ def search(
     underlying content from competing strategies instead of genuinely different
     results. A collection_name with no catalog record is excluded when filtering by
     strategy (nothing to match against), but still searched normally when strategy is
-    None, same as before this parameter existed."""
+    None, same as before this parameter existed.
+
+    A `collection_names` entry with no catalog record at all (never created, or
+    deleted since whatever selected it) is dropped unconditionally, not just when a
+    `strategy` filter happens to be active -- every real collection is registered in
+    the catalog at creation time, so a name absent from it can never be a real,
+    queryable Qdrant collection. Without this, a single stale name (e.g. a leftover
+    browser-side selection referencing a collection that no longer exists, or was
+    created under a different workspace) reached Qdrant directly and crashed the
+    *entire* request with an unhandled ValueError -- even though every other,
+    genuinely-selected collection in the same request would have searched fine.
+    Confirmed by direct reproduction: a request scoped to one real collection plus one
+    stale name 500'd outright instead of just skipping the stale one."""
     if not collection_names:
         return []
 
@@ -94,11 +106,13 @@ def search(
         except catalog.NotFoundError:
             collection_records[name] = None
 
+    collection_names = [name for name in collection_names if collection_records[name] is not None]
+    if not collection_names:
+        return []
+
     if strategy is not None:
         collection_names = [
-            name
-            for name in collection_names
-            if collection_records[name] is not None and collection_records[name].chunking_strategy == strategy
+            name for name in collection_names if collection_records[name].chunking_strategy == strategy
         ]
         if not collection_names:
             return []
