@@ -1,12 +1,15 @@
 "use client";
 
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { deleteChatSession, listChatSessions } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { cn } from "@/lib/utils";
-import { Plus, Trash2, Loader2, MessageSquareText } from "lucide-react";
+import { Plus, Trash2, Loader2, MessageSquareText, PanelLeftClose } from "lucide-react";
+
+const PAGE_SIZE = 10;
 
 function relativeTime(iso: string): string {
   const diffMs = Date.now() - new Date(iso).getTime();
@@ -23,13 +26,25 @@ export function ChatSessionList({
   activeSessionId,
   onSelect,
   onNewChat,
+  onCollapse,
 }: {
   activeSessionId: string | null;
   onSelect: (sessionId: string) => void;
   onNewChat: () => void;
+  onCollapse: () => void;
 }) {
   const queryClient = useQueryClient();
-  const { data: sessions, isLoading } = useQuery({ queryKey: ["chat-sessions"], queryFn: listChatSessions });
+  // "Load more" grows `limit` by PAGE_SIZE and just refetches the whole (bigger)
+  // page each time -- simpler than tracking offset-based accumulation client-side,
+  // and the DuckDB query itself is cheap enough (LIMIT/OFFSET on an indexed sort)
+  // that re-fetching a growing page isn't a real cost at this scale. A returned
+  // page shorter than `limit` means there's nothing more -- see chat_crud.list_sessions().
+  const [limit, setLimit] = useState(PAGE_SIZE);
+  const { data: sessions, isLoading } = useQuery({
+    queryKey: ["chat-sessions", limit],
+    queryFn: () => listChatSessions(limit),
+  });
+  const hasMore = (sessions?.length ?? 0) === limit;
 
   const deleteMutation = useMutation({
     mutationFn: deleteChatSession,
@@ -42,6 +57,12 @@ export function ChatSessionList({
 
   return (
     <aside className="flex h-full w-60 shrink-0 flex-col gap-3 border-r border-border px-3 py-5">
+      <div className="flex items-center justify-between px-1">
+        <span className="text-sm font-semibold">Chat history</span>
+        <Button variant="ghost" size="icon" className="size-7" onClick={onCollapse} title="Hide chat history">
+          <PanelLeftClose className="size-4" />
+        </Button>
+      </div>
       <Button variant="outline" size="sm" className="justify-start" onClick={onNewChat}>
         <Plus className="size-3.5" /> New chat
       </Button>
@@ -90,6 +111,17 @@ export function ChatSessionList({
             />
           </div>
         ))}
+        {hasMore && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="mt-1 justify-center text-xs text-muted-foreground"
+            onClick={() => setLimit((l) => l + PAGE_SIZE)}
+            disabled={isLoading}
+          >
+            {isLoading ? <Loader2 className="size-3.5 animate-spin" /> : "Load more"}
+          </Button>
+        )}
       </div>
     </aside>
   );

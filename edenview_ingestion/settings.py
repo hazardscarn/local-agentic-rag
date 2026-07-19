@@ -15,6 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
+import ollama
 import yaml
 from ruamel.yaml import YAML
 
@@ -66,8 +67,67 @@ def get_ollama_keep_alive() -> str:
     return str(load_config().get("ollama", {}).get("keep_alive", "30m"))
 
 
+def get_chat_num_ctx() -> int:
+    """Ollama's request-time num_ctx for the /chat endpoint's chat_llm -- see
+    config.yaml's `models.chat_num_ctx` comment for the real bug this fixes (a
+    retrieved-context prompt silently truncated to Ollama's ~2048 default, leaving
+    no room for the model to actually answer) and why the default is generous
+    (32768, not a smaller value) -- generate_answer() deliberately keeps a
+    thinking-capable model's reasoning on, and that needs real headroom too."""
+    return int(load_config().get("models", {}).get("chat_num_ctx", 32768))
+
+
 def get_dense_embedding_dim() -> int:
     return int(load_config()["models"]["dense_embedding_dim"])
+
+
+def get_agent_model() -> str:
+    """Raw read of config.yaml's `agent.model` -- NOT the same thing as
+    edenview_RAG.agentic_rag.config.get_agent_model_name(), which this module can't
+    import (that package imports settings.py, not the other way around). This is
+    just the on-disk value, for the Settings API to read/write; the agentic_rag
+    package's own getter is what anything actually building the agent tree uses."""
+    return load_config()["agent"]["model"]
+
+
+def get_agent_vision_model() -> Optional[str]:
+    """Raw read of config.yaml's `agent.vision_model` -- None means "unset", NOT
+    "resolved to agent_model". The fallback-to-agent_model-if-vision-capable logic
+    lives in edenview_RAG.agentic_rag.config.get_vision_model(), which this raw
+    getter deliberately does not replicate (same reasoning as get_agent_model())."""
+    return load_config().get("agent", {}).get("vision_model")
+
+
+def get_agent_max_iterations() -> int:
+    return int(load_config().get("agent", {}).get("max_iterations", 3))
+
+
+# API-facing flat key -> its real name under config.yaml's `agent:` section.
+AGENT_KEY_MAP = {
+    "agent_model": "model",
+    "agent_vision_model": "vision_model",
+    "agent_max_iterations": "max_iterations",
+}
+
+
+@lru_cache(maxsize=8)
+def model_supports_capability(model: str, capability: str, ollama_host: Optional[str] = None) -> bool:
+    """Checks a model's actual reported capabilities via Ollama's own `/api/show`
+    (e.g. `capabilities: ["completion", "tools", "vision", "thinking"]`) rather than
+    assuming -- confirmed directly, more than once, that requesting a capability a
+    model doesn't have is a hard failure, not a graceful no-op (e.g. `think=True`
+    against a non-thinking model raises a real `400 "<model> does not support
+    thinking"` from Ollama). Shared by both edenview_RAG.retrieval (Simple RAG's
+    thinking gate) and edenview_RAG.agentic_rag (tool-calling/vision gates) so there's
+    one place this check lives, not two near-duplicates. Treats an unreachable/unknown
+    model as lacking the capability rather than guessing."""
+    client = ollama.Client(host=ollama_host) if ollama_host else ollama.Client()
+    try:
+        info = client.show(model)
+    except Exception:
+        return False
+    capabilities = info.get("capabilities") if isinstance(info, dict) else getattr(info, "capabilities", None)
+    return capability in (capabilities or [])
 
 
 def _auto_num_threads() -> int:
@@ -205,20 +265,23 @@ def get_documents_dir() -> Path:
 
 
 def get_all_model_settings() -> dict:
-    """Every key in MODEL_KEYS plus the Ollama host/keep_alive, for a Settings UI to
-    render as a form. Reads through the cached load_config(), same as every other
-    getter here."""
+    """Every key in MODEL_KEYS plus the Ollama host/keep_alive and the agent.* keys,
+    for a Settings UI to render as a form. Reads through the cached load_config(),
+    same as every other getter here."""
     config = load_config()
     settings = {key: config["models"][key] for key in MODEL_KEYS}
     settings["ollama_host"] = get_ollama_host()
     settings["ollama_keep_alive"] = get_ollama_keep_alive()
+    settings["agent_model"] = get_agent_model()
+    settings["agent_vision_model"] = get_agent_vision_model()
+    settings["agent_max_iterations"] = get_agent_max_iterations()
     return settings
 
 
 def update_model_settings(updates: dict) -> dict:
     """Merges `updates` (a subset of MODEL_KEYS, plus optionally "ollama_host"/
-    "ollama_keep_alive") into config.yaml on disk and returns the full settings
-    afterward.
+    "ollama_keep_alive"/AGENT_KEY_MAP's keys) into config.yaml on disk and returns
+    the full settings afterward.
 
     Uses ruamel.yaml's round-trip mode instead of pyyaml -- config.yaml carries an
     explanatory comment above nearly every key, and yaml.safe_dump would silently
@@ -228,9 +291,10 @@ def update_model_settings(updates: dict) -> dict:
     Clears load_config()'s lru_cache afterward so the next read (in this same
     process) picks up the change -- though see api/routers/config.py's
     RESTART_REQUIRED_KEYS for which settings are actually consumed fresh per call
-    versus baked into a module-level default at import time.
+    versus baked into a module-level default (or an import-time check, for the
+    agent.* keys) at import time.
     """
-    special_cased = {"ollama_host", "ollama_keep_alive"}
+    special_cased = {"ollama_host", "ollama_keep_alive"} | set(AGENT_KEY_MAP)
     unknown = set(updates) - set(MODEL_KEYS) - special_cased
     if unknown:
         raise KeyError(f"Unknown config key(s): {sorted(unknown)}")
@@ -245,6 +309,8 @@ def update_model_settings(updates: dict) -> dict:
             doc["ollama"]["host"] = value
         elif key == "ollama_keep_alive":
             doc["ollama"]["keep_alive"] = value
+        elif key in AGENT_KEY_MAP:
+            doc.setdefault("agent", {})[AGENT_KEY_MAP[key]] = value
         else:
             doc["models"][key] = value
 

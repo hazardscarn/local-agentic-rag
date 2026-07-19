@@ -12,9 +12,8 @@ conversation/state bookkeeping so the agent actually has multi-turn memory.
 
 from __future__ import annotations
 
-from functools import lru_cache
+import asyncio
 
-from google.adk.artifacts import InMemoryArtifactService
 from google.adk.runners import Runner
 from google.adk.sessions import DatabaseSessionService
 from google.genai import types
@@ -24,34 +23,17 @@ from edenview_RAG.retrieval import RetrievalHit
 
 from . import agent as agent_trees
 from . import prompts
-from .config import Effort, RetrievalScope
+from .callbacks import _status_queue_var
+from .config import RetrievalScope
 
 _APP_NAME = "edenview_agentic_rag"
 _USER_ID = "local"  # single-user local app, matching every other part of this codebase
 
 _ADK_DB_PATH = get_workspace_root() / "adk_sessions.db"
 _session_service = DatabaseSessionService(db_url=f"sqlite+aiosqlite:///{_ADK_DB_PATH}")
-# In-memory (not disk-backed) on purpose -- retrieved-chunk images used by
-# tools.inspect_image only need to live for the duration of one turn, not survive a
-# restart, so there's no need for a custom disk-backed ArtifactService (core ADK only
-# ships InMemoryArtifactService/GcsArtifactService, neither local-disk).
-_artifact_service = InMemoryArtifactService()
 
-_BUILDERS = {
-    "low": agent_trees.build_low_agent,
-    "medium": lambda: agent_trees.build_medium_agent(),
-    "high": lambda: agent_trees.build_high_agent(),
-}
-
-
-@lru_cache(maxsize=3)
-def _runner_for(effort: Effort) -> Runner:
-    return Runner(
-        agent=_BUILDERS[effort](),
-        app_name=_APP_NAME,
-        session_service=_session_service,
-        artifact_service=_artifact_service,
-    )
+# One Runner for the one pipeline -- no effort tiers anymore, so no per-tier cache.
+_runner = Runner(agent=agent_trees.root_agent, app_name=_APP_NAME, session_service=_session_service)
 
 
 def _extract_final_text(parts) -> str:
@@ -122,17 +104,42 @@ def _reset_litellm_logging_worker() -> None:
         pass  # best-effort -- never let a logging-plumbing reset break a real turn
 
 
-async def _run_once(query: str, scope: RetrievalScope, effort: Effort, session_id: str) -> tuple[str, str, list[RetrievalHit]]:
-    runner = _runner_for(effort)
+def _ordered_citations(session) -> list[RetrievalHit]:
+    """Builds the final citations list in the same order the answer's own
+    inline [N] markers use, via state["final_citation_order"] (the
+    {global_number: chunk_id} map callbacks.prepare_consolidated_findings
+    writes) -- so citations[N-1] in the API response really is the chunk
+    marker [N] in the answer text refers to. Required for the frontend's
+    clickable inline citations (chat-message.tsx) to jump to the right source.
+    Falls back to today's dict-insertion order if that key is absent -- e.g.
+    Simple RAG's non-agentic /chat path, which never runs this pipeline's
+    callbacks at all. Dict keys may come back as strings (JSON round-trip
+    through session persistence), hence `key=int` rather than assuming int."""
+    if not session:
+        return []
+    citations_raw: dict = session.state.get("citations", {})
+    final_citation_order: dict = session.state.get("final_citation_order") or {}
+    if not final_citation_order:
+        return [RetrievalHit(**d) for d in citations_raw.values()]
+    ordered = []
+    for number in sorted(final_citation_order, key=int):
+        chunk_id = final_citation_order[number]
+        hit = citations_raw.get(chunk_id)
+        if hit:
+            ordered.append(RetrievalHit(**hit))
+    return ordered
+
+
+async def _run_once(query: str, scope: RetrievalScope, session_id: str) -> tuple[str, str, list[RetrievalHit]]:
     await _ensure_session(session_id)
 
     final_text = ""
     thinking_chunks: list[str] = []
-    async for event in runner.run_async(
+    async for event in _runner.run_async(
         user_id=_USER_ID,
         session_id=session_id,
         new_message=types.Content(role="user", parts=[types.Part(text=query)]),
-        state_delta={"scope": scope.model_dump(), "citations": {}},
+        state_delta={"scope": scope.model_dump(), "citations": {}, "sub_answers": [], "final_answer": ""},
     ):
         if event.content and event.content.parts:
             thought = _extract_thought_text(event.content.parts)
@@ -144,12 +151,11 @@ async def _run_once(query: str, scope: RetrievalScope, effort: Effort, session_i
                 final_text = text
 
     session = await _session_service.get_session(app_name=_APP_NAME, user_id=_USER_ID, session_id=session_id)
-    citations_raw = session.state.get("citations", {}) if session else {}
-    citations = [RetrievalHit(**d) for d in citations_raw.values()]
+    citations = _ordered_citations(session)
     return final_text, "\n\n".join(thinking_chunks), citations
 
 
-async def run_turn(query: str, scope: RetrievalScope, effort: Effort, session_id: str) -> tuple[str, str, list[RetrievalHit]]:
+async def run_turn(query: str, scope: RetrievalScope, session_id: str) -> tuple[str, str, list[RetrievalHit]]:
     """Runs one turn against a persistent ADK session (reused across turns/restarts
     for conversational memory), reading the final response + this turn's own
     reasoning narration + accumulated citations back out. `state_delta` on run_async
@@ -159,78 +165,145 @@ async def run_turn(query: str, scope: RetrievalScope, effort: Effort, session_id
     conversation memory itself does persist.
 
     Returns (answer, thinking, citations) -- `thinking` is every agent step's own
-    `thought=True` narration concatenated in event order (reframe/critic/refiner/
+    `thought=True` narration concatenated in event order (reworder/eval/deep_search/
     root reasoning), kept separate from `answer` so a caller can show it as an
     expandable "thinking" section rather than mixing it into the real answer (see
     _extract_final_text's docstring for the bug this separation fixes).
 
-    Retries the whole turn ONCE if the final answer comes back empty -- a real,
-    recurring characteristic of this local model observed throughout development
-    (occasionally an agent step's entire response lands in native "thinking" content
-    with nothing in regular content, at every position in the pipeline this project
-    tried: low tier's research step, the critic step, the final answer step). Not a
-    fix for that underlying nondeterminism -- retrying the same prompt on the same
-    small model doesn't guarantee a better roll -- but empirically a second attempt
-    frequently succeeds where the first didn't, and an empty response reaching the
-    user is a worse outcome than the modest extra latency of one retry."""
+    If the outer-event-extracted answer comes back empty, first checks
+    state["final_answer"] (populated durably by callbacks.finalize_answer,
+    registered on answer_formatter, which reads its own generation regardless of
+    `thought` flag -- safe there specifically since answer_formatter's only job
+    is ever to produce user-facing prose, unlike other pipeline steps whose
+    `thought` content is deliberately excluded to stop leaked reasoning from
+    being mistaken for a real answer). This salvage covers the common case
+    directly: a real, recurring characteristic of this local model is that its
+    entire response sometimes lands in native "thinking" content with nothing in
+    regular content -- when that happens to answer_formatter specifically, the
+    text is still sitting in state, just not where the outer extraction looks.
+    Only if state["final_answer"] is ALSO empty (a genuine double failure, not
+    just a routing mismatch) does this retry the WHOLE turn once, as a last
+    resort -- not a fix for that underlying nondeterminism, but an empty
+    response reaching the user is a worse outcome than the modest extra latency
+    of one full retry."""
     _reset_litellm_logging_worker()
-    text, thinking, citations = await _run_once(query, scope, effort, session_id)
+    text, thinking, citations = await _run_once(query, scope, session_id)
     if not text.strip():
-        _reset_litellm_logging_worker()
-        text, thinking, citations = await _run_once(query, scope, effort, session_id)
+        session = await _session_service.get_session(app_name=_APP_NAME, user_id=_USER_ID, session_id=session_id)
+        salvaged = (session.state.get("final_answer", "") if session else "").strip()
+        if salvaged:
+            text = salvaged
+        else:
+            _reset_litellm_logging_worker()
+            text, thinking, citations = await _run_once(query, scope, session_id)
     return text, thinking, citations
 
 
-async def run_turn_stream(query: str, scope: RetrievalScope, effort: Effort, session_id: str):
-    """Same turn as run_turn(), but yields live progress as ADK's own event stream
-    arrives, instead of only returning once everything is done -- for the "high"
-    tier especially, a run can genuinely take 30-90+ seconds (reframe + dispatch +
-    up to `max_iterations` critic/refiner rounds + answer), which looks broken in a
-    UI with no feedback for that long. Yields plain dicts:
-    {"type": "status", "message": <human-readable line>} for each tool call/agent
-    phase observed, {"type": "thinking", "message": <reasoning text>} for each
-    step's own `thought=True` narration as it arrives (each agent step's reasoning
-    is its own chunk -- Ollama/ADK doesn't stream token-by-token here, so this is
-    "one thinking chunk per model call," not a live token feed, but it's still
-    real-time relative to the whole run), and exactly one final
-    {"type": "result", "answer": ..., "thinking": ..., "citations": [...]} once the
-    run completes ("thinking" there is every chunk already streamed, concatenated,
-    so a client that only listens for "result" still gets it). No retry-on-empty
-    here (unlike run_turn) -- a caller consuming a live stream has already seen the
-    status trail and would need special handling to silently restart a whole run
-    mid-stream; retry logic stays in the non-streaming path."""
-    _reset_litellm_logging_worker()
-    runner = _runner_for(effort)
-    await _ensure_session(session_id)
+async def _run_turn_and_push(query: str, scope: RetrievalScope, session_id: str, queue: "asyncio.Queue") -> tuple[str, str]:
+    """Runs one turn, pushing every live-status/thinking update into `queue` as it
+    happens, instead of yielding directly -- this is what actually makes
+    run_turn_stream's status granular.
 
+    `queue` is carried via callbacks._status_queue_var, a contextvars.ContextVar,
+    NOT session state -- confirmed by direct reproduction that state can't do this
+    job (see that variable's own docstring for the full story: ADK's
+    InMemorySessionService silently drops `temp:`-prefixed keys when AgentTool
+    seeds a nested sub-agent's brand-new session, and a plain key would make our
+    real DatabaseSessionService try to persist a raw Queue object). Setting the
+    contextvar here, before calling run_async(), means every nested node inside
+    query_pipeline (reworder, search_executor, eval, deep_search, and each of
+    their own tool calls) sees the exact same queue object via
+    callbacks.track_agent_start/track_agent_end/track_tool_start/track_tool_end,
+    confirmed working with ~0.01s latency by direct isolated testing -- this is
+    the actual fix for a real, confirmed ADK limitation: AgentTool.run_async()
+    consumes and discards its own inner events, so the OUTER event stream this
+    function also reads below only ever sees root's own function-call to
+    query_pipeline and the final answer -- never anything from inside it.
+
+    Always pushes a final `None` sentinel (even on error, via `finally`) so
+    run_turn_stream's drain loop knows when to stop waiting."""
     final_text = ""
     thinking_chunks: list[str] = []
-    async for event in runner.run_async(
-        user_id=_USER_ID,
-        session_id=session_id,
-        new_message=types.Content(role="user", parts=[types.Part(text=query)]),
-        state_delta={"scope": scope.model_dump(), "citations": {}},
-    ):
-        for call in event.get_function_calls() or []:
-            label = prompts.STATUS_LABELS.get(call.name, f"Working ({call.name})...")
-            yield {"type": "status", "message": label}
-        if event.author and event.author != "user":
-            tier_label = prompts.AGENT_STATUS_LABELS.get(event.author)
-            if tier_label:
-                yield {"type": "status", "message": tier_label}
-        if event.content and event.content.parts:
-            thought = _extract_thought_text(event.content.parts)
-            if thought:
-                thinking_chunks.append(thought)
-                yield {"type": "thinking", "message": thought}
-        if event.is_final_response() and event.content and event.content.parts:
-            text = _extract_final_text(event.content.parts)
-            if text:
-                final_text = text
+    token = _status_queue_var.set(queue)
+    try:
+        async for event in _runner.run_async(
+            user_id=_USER_ID,
+            session_id=session_id,
+            new_message=types.Content(role="user", parts=[types.Part(text=query)]),
+            state_delta={"scope": scope.model_dump(), "citations": {}, "sub_answers": [], "final_answer": ""},
+        ):
+            for call in event.get_function_calls() or []:
+                label = prompts.STATUS_LABELS.get(call.name, f"Working ({call.name})...")
+                await queue.put({"type": "status", "message": label})
+            if event.author and event.author != "user":
+                tier_label = prompts.AGENT_STATUS_LABELS.get(event.author)
+                if tier_label:
+                    await queue.put({"type": "status", "message": tier_label})
+            if event.content and event.content.parts:
+                thought = _extract_thought_text(event.content.parts)
+                if thought:
+                    thinking_chunks.append(thought)
+                    await queue.put({"type": "thinking", "message": thought})
+            if event.is_final_response() and event.content and event.content.parts:
+                text = _extract_final_text(event.content.parts)
+                if text:
+                    final_text = text
+    finally:
+        _status_queue_var.reset(token)
+        await queue.put(None)  # sentinel -- always fires, success or exception
+    return final_text, "\n\n".join(thinking_chunks)
+
+
+async def run_turn_stream(query: str, scope: RetrievalScope, session_id: str):
+    """Same turn as run_turn(), but yields live progress as it happens, instead of
+    only returning once everything is done -- a run can genuinely take several
+    minutes (reworder + search + up to `max_iterations` eval/deep_search rounds +
+    answer formatting), which looks broken in a UI with no feedback for that long.
+    Yields plain dicts: {"type": "status", "node": ..., "phase": "start"|"end",
+    "message": ..., "duration_s": ...} for every agent/tool boundary anywhere in
+    the pipeline (not just root-level -- see callbacks.track_agent_start/
+    track_agent_end/track_tool_start/track_tool_end, which push these into the
+    shared queue this function drains), {"type": "thinking", "message": ...} for
+    each step's own `thought=True` narration, and exactly one final {"type":
+    "result", "answer": ..., "thinking": ..., "citations": [...]} once the run
+    completes.
+
+    If the outer-event-extracted answer comes back empty, first checks
+    state["final_answer"] (see run_turn's own docstring for the full mechanism
+    -- callbacks.finalize_answer, registered on answer_formatter, captures its
+    generation regardless of `thought` flag, since that node has no legitimate
+    reasoning to hide). Only if that's ALSO empty does this retry the WHOLE
+    turn once, same real, recurring nondeterminism run_turn's own docstring
+    documents. A "trying again" status line is yielded before that full retry
+    so it isn't a silent stall -- the cheap state salvage doesn't need one,
+    since it doesn't re-run anything."""
+    final_text = ""
+    thinking_chunks: list[str] = []
+    for attempt in range(2):
+        if attempt == 1:
+            yield {"type": "status", "message": "Didn't get a clear answer -- trying again..."}
+        _reset_litellm_logging_worker()
+        await _ensure_session(session_id)
+        queue: asyncio.Queue = asyncio.Queue()
+        task = asyncio.create_task(_run_turn_and_push(query, scope, session_id, queue))
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+            if item["type"] == "thinking":
+                thinking_chunks.append(item["message"])
+        final_text, _ = await task
+        if not final_text.strip():
+            session = await _session_service.get_session(app_name=_APP_NAME, user_id=_USER_ID, session_id=session_id)
+            salvaged = (session.state.get("final_answer", "") if session else "").strip()
+            if salvaged:
+                final_text = salvaged
+        if final_text.strip():
+            break
 
     session = await _session_service.get_session(app_name=_APP_NAME, user_id=_USER_ID, session_id=session_id)
-    citations_raw = session.state.get("citations", {}) if session else {}
-    citations = [RetrievalHit(**d) for d in citations_raw.values()]
+    citations = _ordered_citations(session)
     yield {
         "type": "result",
         "answer": final_text,

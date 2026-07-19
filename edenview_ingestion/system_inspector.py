@@ -45,6 +45,19 @@ class OllamaModelInfo(BaseModel):
     size_gb: float
 
 
+class OllamaModelCapabilities(BaseModel):
+    """Same pulled-model identity as OllamaModelInfo, plus its reported capabilities
+    (e.g. ["completion", "tools", "vision", "thinking"]) -- used to filter a
+    model-selection dropdown to only options that will actually work (e.g. the
+    agentic RAG pipeline's agent_model needs "tools"). Deliberately NOT part of
+    OllamaModelInfo/get_system_specs() -- see list_ollama_models_with_capabilities()'s
+    own docstring for why."""
+
+    name: str
+    size_gb: float
+    capabilities: list[str]
+
+
 class OllamaInfo(BaseModel):
     available: bool
     host: str
@@ -150,6 +163,38 @@ def _detect_ollama() -> OllamaInfo:
         return OllamaInfo(available=False, host=host, models=[], error=str(e))
 
 
+def list_ollama_models_with_capabilities() -> list[OllamaModelCapabilities]:
+    """Every pulled model's name/size PLUS its reported capabilities -- one extra
+    `client.show()` call per pulled model, on top of the one `client.list()` call.
+    Deliberately NOT folded into _detect_ollama()/get_system_specs(): that backs
+    GET /system/info, which the frontend polls every 4s (system-monitor.tsx) and
+    30s (sidebar.tsx) -- paying N extra Ollama round-trips on every one of those
+    polls would be real, needless overhead for data that's static until the user
+    pulls or removes a model. This is called once per Settings page load instead
+    (GET /system/ollama/models), where that cost is negligible. Gracefully returns
+    [] if Ollama isn't reachable, and treats a single model's failed `show()` call
+    as "no known capabilities" rather than failing the whole list."""
+    host = get_ollama_host() or "http://localhost:11434"
+    try:
+        client = ollama.Client(host=host)
+        response = client.list()
+    except Exception:
+        return []
+    results = []
+    for m in response.models:
+        try:
+            info = client.show(m.model)
+            capabilities = info.get("capabilities") if isinstance(info, dict) else getattr(info, "capabilities", None)
+        except Exception:
+            capabilities = []
+        results.append(
+            OllamaModelCapabilities(
+                name=m.model, size_gb=round((m.size or 0) / (1024**3), 2), capabilities=capabilities or []
+            )
+        )
+    return results
+
+
 def get_loaded_ollama_models() -> list[LoadedModelInfo]:
     """Currently-loaded Ollama models -- these sit in RAM/VRAM until Ollama evicts
     them (on their own `expires_at`, or immediately via unload_ollama_model() below),
@@ -177,6 +222,28 @@ def unload_ollama_model(model: str) -> None:
     keep_alive=0 unloads without doing any real generation work."""
     host = get_ollama_host() or "http://localhost:11434"
     ollama.Client(host=host).generate(model=model, prompt="", keep_alive=0)
+
+
+def unload_all_ollama_models() -> list[str]:
+    """Bulk version of unload_ollama_model() -- evicts every model get_loaded_ollama_models()
+    currently reports, for a single "free everything up" reset action instead of
+    unloading each one by hand. Returns the names actually unloaded; one model failing
+    to unload (e.g. Ollama restarted between the ps() call and this one) is skipped
+    rather than aborting the rest, same tolerance as clear_stale_jobs().
+
+    This only reclaims memory a model is holding *idle* -- Ollama has no cancel
+    endpoint, so it can't interrupt a generate/chat call that's actively streaming
+    right now (that finishes on its own, same as unload_ollama_model()); it just stops
+    that model's memory from being held afterward and prevents new calls from reusing
+    it warm."""
+    unloaded = []
+    for model in get_loaded_ollama_models():
+        try:
+            unload_ollama_model(model.name)
+            unloaded.append(model.name)
+        except Exception:
+            continue
+    return unloaded
 
 
 @lru_cache(maxsize=1)

@@ -61,11 +61,11 @@ curl -s http://localhost:8000/chunking/strategies
 
 ### Step 3 — upload and ingest a file
 
-Use any PDF, or the sample already in the repo:
+Use any PDF you have on hand:
 
 ```bash
 curl -s -X POST http://localhost:8000/ingest \
-  -F "file=@data/sample_files/covid-19-risk-factors-Japan.pdf" \
+  -F "file=@/path/to/your.pdf" \
   -F "db_name=my-first-db" \
   -F "collection_name=my-first-collection" \
   -F "strategy=hybrid_docling"
@@ -440,6 +440,35 @@ curl -s -X POST http://localhost:8000/system/ollama/unload \
 → `204`. Uses Ollama's own documented immediate-unload pattern
 (`generate(model=X, prompt="", keep_alive=0)`).
 
+**`GET /system/ollama/models`** — every pulled Ollama model's name/size/capabilities
+(e.g. `"tools"`, `"vision"`), for filtering a model-selection dropdown to only
+options that will actually work. Deliberately separate from `GET /system/info`
+(polled every 4s/30s by the sidebar) since this costs one extra `ollama show` call
+per model — fetched once per Settings page load instead.
+```bash
+curl -s http://localhost:8000/system/ollama/models
+```
+```json
+[{"name": "qwen3.5:2b", "size_gb": 2.47, "capabilities": ["tools", "completion"]}, ...]
+```
+
+### System — Maintenance
+
+**`POST /system/jobs/clear-stale`** — marks every ingestion job left
+`"queued"`/`"running"` by a backend that crashed or was restarted mid-job as
+`"error"`. Only touches job status rows, never real documents/collections/chat
+data — safe to call any time, including with nothing actually stale.
+```bash
+curl -s -X POST http://localhost:8000/system/jobs/clear-stale
+```
+```json
+{"cleared_count": 2, "cleared_filenames": ["report.pdf", "resume_042.pdf"]}
+```
+Shares its backend logic (`catalog.crud.clear_stale_jobs()`) with
+`scripts/fresh_start.py`, a standalone dev-environment reset script that also
+kills stray processes on this project's dev ports — the API route only does the
+job-clearing half, not the process-killing half, since that's a dev-only concern.
+
 ### System — Performance
 
 **`GET`/`PUT /system/performance`** — Docling extraction pipeline tuning:
@@ -488,8 +517,12 @@ endpoint always returns `200`.
 
 **`POST /chat`** — hybrid search (same as `/search`) followed by either one Ollama
 chat call over the retrieved context (**Simple RAG**, the default), or a full
-ADK-based agentic loop (**Agentic RAG**, `edenview_RAG.agentic_rag` — reframe/split →
-retrieve → critic/refiner refinement loop → cited answer; see that package for the
+ADK-based agentic pipeline (**Agentic RAG**, `edenview_RAG.agentic_rag` — one flat
+`root_agent` → `query_pipeline` (`question_capture` → `decompose`, once per turn →
+`subquestion_orchestrator`, running a full `search_executor`/`eval`/`reworder`/
+`deep_search` research loop independently per decomposed sub-question, each
+producing its own drafted, cited answer → `answer_formatter`, consolidating those
+drafts into one final answer); see that package's own module docstrings for the
 full design). Both modes return the same `ChatResponse` shape and persist to the
 same `chat_sessions`/`chat_messages` tables.
 ```bash
@@ -508,55 +541,88 @@ curl -s -X POST http://localhost:8000/chat \
 Body: same scoping fields as `/search` (`query` required, exactly one of
 `collection_names`/`db_name`, `top_k`, `use_reranker`, `file_hashes`, `strategy`)
 plus optional `chat_model` (overrides config.yaml's `models.chat_llm` for this one
-call, Simple RAG only), `agentic` (bool, default `false`), and `effort`
-(`"low"`/`"medium"`/`"high"`, default `"high"`, only relevant when `agentic: true` —
-see `edenview_RAG/agentic_rag`'s own docs for what each tier does). **`400`** if
-neither `collection_names` nor `db_name` is given.
+call, Simple RAG only) and `agentic` (bool, default `false`). No effort/tier
+selector — the agentic pipeline is one flat design now, not a choice of tiers.
+**`400`** if neither `collection_names` nor `db_name` is given.
 
-→ `{"answer": str, "citations": list[RetrievalHit], "model_used": str, "session_id": str}`.
+→ `{"answer": str, "citations": list[RetrievalHit], "model_used": str, "session_id": str, "thinking": str | null}`.
 `citations` is the same `RetrievalHit` list `/search` returns — index into it to
 match the answer's `[1]`/`[2]` markers, which refer to citation position (1-based)
 in that list. Simple RAG: if nothing relevant is found, `answer` is a canned "no
 relevant information" message, `citations` is `[]`, and no LLM call is made.
 Agentic RAG: `model_used` is `config.yaml`'s `agent.model`, ignoring `chat_model`
-(the agentic loop always uses the one shared agent model, never a per-request
-override).
+(the agentic pipeline always uses the one shared agent model, never a per-request
+override); `thinking` carries the agent's own reasoning/planning narration for the
+turn, kept separate from `answer` so a UI can show it as an expandable section
+rather than as part of the displayed response.
 
 **`POST /chat/stream`** — SSE variant of `POST /chat`, **agentic requests only**
-(**`400`** if `agentic` isn't `true`). Same request body as `/chat`. Forwards ADK's
-own event stream as short human-readable status lines while the agent works — a
-`"high"` effort turn can genuinely take 30–90+ seconds (reframe + dispatch + up to
-`max_iterations` critic/refiner rounds + answer), and a bare spinner reads as broken
-for that long.
+(**`400`** if `agentic` isn't `true`). Same request body as `/chat`. Streams live
+per-node and per-tool-call status as the pipeline runs — a real turn can genuinely
+take several minutes (reworder + search + up to `agent.max_iterations` eval/
+deep-search rounds + answer formatting, native "thinking" kept on for every LLM
+step to reduce hallucination), and a bare spinner reads as broken for that long.
 ```bash
 curl -s -N -X POST http://localhost:8000/chat/stream \
   -H "Content-Type: application/json" \
-  -d '{"query": "...", "collection_names": ["my-first-collection"], "agentic": true, "effort": "low"}'
+  -d '{"query": "...", "collection_names": ["my-first-collection"], "agentic": true}'
 ```
 ```
-data: {"type": "status", "message": "Searching your documents..."}
+data: {"type": "status", "node": "reworder", "phase": "start", "message": "Rewording your question..."}
 
-data: {"type": "result", "answer": "...", "citations": [...], "model_used": "qwen3.5:4b", "session_id": "..."}
+data: {"type": "status", "node": "reworder", "phase": "end", "duration_s": 4.2}
+
+data: {"type": "status", "node": "vector_search", "phase": "start", "message": "Searching your documents..."}
+
+data: {"type": "thinking", "message": "...agent's reasoning chunk..."}
+
+data: {"type": "result", "answer": "...", "citations": [...], "model_used": "qwen3.5:2b", "session_id": "...", "thinking": "..."}
 ```
-Every frame is `data: {json}\n\n`. `{"type": "status", "message": str}` zero or more
-times, then exactly one `{"type": "result", "answer": str, "citations":
-list[RetrievalHit], "model_used": str, "session_id": str}` — the same shape
-`/chat` returns, persisted to `chat_messages` the same way once it fires. The
-Chat UI's "Agentic RAG" mode uses this endpoint (via `EventSource`-style manual SSE
-parsing over `fetch`, not `EventSource` itself, since that API can't send a POST
-body — see `edenview-ui/src/lib/api.ts`'s `runChatStream`); `POST /chat`'s own
-`agentic: true` path stays available for scripts/tests and for `"low"` effort where
-latency doesn't really warrant streaming.
+Every frame is `data: {json}\n\n`. Zero or more `{"type": "status", ...}` frames,
+interleaved with zero or more `{"type": "thinking", "message": str}` frames, then
+exactly one `{"type": "result", ...}` frame — the same shape `/chat` returns,
+persisted to `chat_messages` the same way once it fires. A `status` frame's `node`
+is either an agent name (`reworder`, `eval`, `deep_search`, ...) or a tool name
+(`vector_search`, `get_images`, ...) — granular down to individual tool calls, not
+just top-level agent phases; `phase: "start"` always carries a human-readable
+`message`, `phase: "end"` carries `duration_s` instead. This is the same event
+shape a future flowchart-style status UI (lighting up the active node) would
+consume, not just a simple status line — see `edenview-ui/src/lib/types.ts`'s
+`AgenticStatusEvent`. The Chat UI's "Agentic RAG" mode uses this endpoint (via
+manual SSE frame-parsing over `fetch`, not `EventSource`, since that API can't send
+a POST body — see `edenview-ui/src/lib/api.ts`'s `runChatStream`); `POST /chat`'s
+own `agentic: true` path stays available for scripts/tests where live progress
+doesn't matter.
+
+This turn actually runs via an in-memory per-session broadcast registry
+(`api/routers/chat.py`'s `_active_turns`) — `POST /chat/stream`'s own connection is
+just that turn's first subscriber, not the only possible one.
+
+**`GET /chat/stream/{session_id}`** — reattaches to a still-running turn on this
+session (page reload, switching chats and back, or any client that wasn't the one
+that started it): replays every event already emitted, then continues live exactly
+like the original `POST /chat/stream` connection.
+```bash
+curl -s -N http://localhost:8000/chat/stream/<session_id>
+```
+If nothing is actually in flight for that session (already finished, never
+started, or its ~30s post-completion grace period already elapsed), yields exactly
+one `{"type": "not_running"}` frame and closes — cheap and safe to call
+unconditionally on every session load, no need to check first. A turn keeps
+running and persists its answer regardless of whether any client is subscribed —
+dropping every connection doesn't stop it.
 
 ### System — model config
 
 **`GET /system/config`** — every model name from `config.yaml`'s `models:` section,
-plus the configured Ollama host, for a Settings UI to render as a form.
+plus the configured Ollama host and the agentic pipeline's own model settings
+(`agent_model`, `agent_vision_model`, `agent_max_iterations`, from `config.yaml`'s
+`agent:` section), for a Settings UI to render as a form.
 ```bash
 curl -s http://localhost:8000/system/config
 ```
 ```json
-{"tokenizer":"BAAI/bge-m3","dense_embedding":"bge-m3","dense_embedding_dim":1024,"sparse_embedding":"Qdrant/bm25","contextual_llm":"qwen3:4b","picture_description_llm":"qwen3-vl:2b","chat_llm":"qwen3:4b","reranker":"Xenova/ms-marco-MiniLM-L-6-v2","ollama_host":"http://localhost:11434"}
+{"tokenizer":"BAAI/bge-m3","dense_embedding":"bge-m3","dense_embedding_dim":1024,"sparse_embedding":"Qdrant/bm25","contextual_llm":"qwen3:4b","picture_description_llm":"qwen3-vl:2b","chat_llm":"qwen3:4b","reranker":"Xenova/ms-marco-MiniLM-L-6-v2","ollama_host":"http://localhost:11434","agent_model":"qwen3.5:2b","agent_vision_model":null,"agent_max_iterations":3}
 ```
 
 **`PUT /system/config`** — updates one or more of those keys, **persisted to
@@ -571,17 +637,22 @@ curl -s -X PUT http://localhost:8000/system/config \
 {"updated": {"...": "...", "chat_llm": "qwen3:8b"}, "restart_required": []}
 ```
 Body: any subset of the fields `GET /system/config` returns. **`400`** if an unknown
-key is sent, or if the body is empty.
+key is sent, if the body is empty, or if `agent_model` is set to a model that
+doesn't report tool-calling support (checked live via `ollama show` at request
+time — the agentic pipeline hard-requires this, see `edenview_progress.md`'s
+architecture table). `agent_vision_model` has no equivalent hard check — an
+unavailable vision model degrades gracefully instead of erroring.
 
 `restart_required` lists which of the keys you just changed need the API server
 restarted to actually take effect. Traced through the real call sites, not guessed:
 `dense_embedding` and `ollama_host` are read fresh on every embed call
 (`vectorstore/embedding.py`), and `chat_llm` is read fresh on every `/chat` call
 (`api/routers/chat.py`), so those three apply immediately. `tokenizer`,
-`sparse_embedding`, `contextual_llm`, `picture_description_llm`, and `reranker` are
-each baked into a Pydantic config class's default (or, for `sparse_embedding`, a
-module-global cached model instance) at process import time — changing them in
-config.yaml only takes effect on the next `uvicorn` restart.
+`sparse_embedding`, `contextual_llm`, `picture_description_llm`, `reranker`, and
+all three `agent_*` keys are each baked into a Pydantic config class's default (or,
+for `sparse_embedding`/the agentic pipeline's shared LLM, a module-global cached
+instance) at process import time — changing them in config.yaml only takes effect
+on the next `uvicorn` restart.
 
 ### Files
 

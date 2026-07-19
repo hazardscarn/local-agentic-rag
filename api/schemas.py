@@ -5,7 +5,7 @@ response_model instead of a duplicate schema to keep in sync."""
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -108,12 +108,12 @@ class ChatRequest(SearchRequest):
     session_id: Optional[str] = None
 
     # False (default) -> today's single retrieval pass + one LLM call (generate_answer).
-    # True -> edenview_RAG.agentic_rag's ADK-based loop (reframe/split, retrieval,
-    # a critic/refiner refinement loop, page/image tools depending on `effort`) --
-    # see edenview_RAG/agentic_rag/ for what each tier actually does. Matches the
-    # Chat UI's "Simple RAG" / "Agentic RAG" toggle in the same scope panel.
+    # True -> edenview_RAG.agentic_rag's ADK-based pipeline (reword/split, retrieval,
+    # an eval/deep-search refinement loop, then a formatted final answer) -- see
+    # edenview_RAG/agentic_rag/ for the full node breakdown. No effort tiers -- one
+    # flat pipeline. Matches the Chat UI's "Simple RAG" / "Agentic RAG" toggle in the
+    # same scope panel.
     agentic: bool = False
-    effort: Literal["low", "medium", "high"] = "high"
 
     @field_validator("chat_model", "session_id", mode="before")
     @classmethod
@@ -158,6 +158,20 @@ class ModelSettings(BaseModel):
     # e.g. "30m", "1h", "-1" (never), "0" (immediately). Applies live, no restart --
     # see edenview_ingestion.settings.get_ollama_keep_alive().
     ollama_keep_alive: Optional[str] = None
+    # agent_* mirror config.yaml's `agent:` section (edenview_RAG/agentic_rag), kept
+    # here rather than a separate endpoint -- same flat-settings-object convention as
+    # everything else above. Unlike chat_llm/contextual_llm (read fresh per call),
+    # these three are always restart-required: get_shared_llm()/get_reword_llm() are
+    # @lru_cache(maxsize=1) singletons and require_tool_calling_model() runs once at
+    # agent.py's own module import time (see api/routers/config.py's
+    # RESTART_REQUIRED_KEYS).
+    agent_model: str
+    # None means "reuse agent_model if it's vision-capable, else unavailable" -- see
+    # edenview_RAG.agentic_rag.config.get_vision_model()'s own fallback logic, which
+    # this field's raw value feeds (edenview_ingestion.settings does NOT replicate
+    # that fallback -- only the raw config.yaml read).
+    agent_vision_model: Optional[str] = None
+    agent_max_iterations: int
 
 
 class UpdateModelSettingsRequest(BaseModel):
@@ -178,6 +192,19 @@ class UpdateModelSettingsRequest(BaseModel):
     reranker: Optional[str] = None
     ollama_host: Optional[str] = None
     ollama_keep_alive: Optional[str] = None
+    agent_model: Optional[str] = None
+    agent_vision_model: Optional[str] = None
+    agent_max_iterations: Optional[int] = None
+
+    @field_validator("agent_vision_model", mode="before")
+    @classmethod
+    def _blank_agent_vision_model_to_none(cls, v):
+        """Same convention as ChatRequest._blank_chat_model_to_none -- the UI's "use
+        default" option submits "" to mean "no override", which must round-trip to a
+        real `null` in config.yaml, not the literal string "" as a bogus model name."""
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return v
 
 
 class UpdateModelSettingsResponse(BaseModel):
@@ -227,5 +254,21 @@ class UpdatePerformanceRequest(BaseModel):
     max_concurrent_extractions: Optional[int] = None
 
 
+class ClearStaleJobsResponse(BaseModel):
+    # Jobs that were "queued"/"running" with no process left actually working on
+    # them (a crashed/restarted backend never got to mark them "error") -- see
+    # edenview_ingestion/catalog/crud.py's clear_stale_jobs(). Filenames, not full
+    # job records -- just enough for a UI toast to say what got cleaned up.
+    cleared_count: int
+    cleared_filenames: list[str]
+
+
 class UnloadModelRequest(BaseModel):
     model: str
+
+
+class UnloadAllModelsResponse(BaseModel):
+    # Names of the models that were actually loaded and got unloaded -- empty if
+    # nothing was loaded to begin with (not an error, same convention as
+    # ClearStaleJobsResponse above).
+    models_unloaded: list[str]

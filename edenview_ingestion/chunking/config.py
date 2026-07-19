@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from edenview_ingestion.settings import get_model, get_ollama_host
 
@@ -24,6 +24,14 @@ class RecursiveOverlapConfig(BaseModel):
     chunk_size: int = 512
     chunk_overlap: int = 50
 
+    @model_validator(mode="after")
+    def _check_overlap(self):
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError(
+                f"chunk_overlap ({self.chunk_overlap}) must be smaller than chunk_size ({self.chunk_size})"
+            )
+        return self
+
 
 class HybridDoclingConfig(BaseModel):
     tokenizer_model: str = DEFAULT_TOKENIZER_MODEL
@@ -35,6 +43,15 @@ class ParentChildConfig(BaseModel):
     tokenizer_model: str = DEFAULT_TOKENIZER_MODEL
     child_max_tokens: int = 180
     parent_max_tokens: int = 2000
+
+    @model_validator(mode="after")
+    def _check_budget(self):
+        if self.child_max_tokens >= self.parent_max_tokens:
+            raise ValueError(
+                f"child_max_tokens ({self.child_max_tokens}) must be smaller than "
+                f"parent_max_tokens ({self.parent_max_tokens})"
+            )
+        return self
 
 
 class ContextualConfig(BaseModel):

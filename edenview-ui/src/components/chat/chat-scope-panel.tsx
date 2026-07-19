@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useQuery } from "@tanstack/react-query";
 import { getModelSettings, getSystemInfo, listChunkingStrategies, listCollections, listDbs } from "@/lib/api";
 import { Label } from "@/components/ui/label";
@@ -23,10 +24,9 @@ export interface ChatScope {
   strategy: string;
   chatModel: string;
   // Simple RAG (one retrieval pass + one LLM call, POST /chat) vs. Agentic RAG
-  // (edenview_RAG.agentic_rag's ADK-based reframe/retrieve/critique loop,
-  // POST /chat/stream) -- `effort` only matters when agentic is true.
+  // (edenview_RAG.agentic_rag's ADK-based reword/retrieve/eval/deep-search
+  // pipeline, POST /chat/stream) -- one flat pipeline, no effort tiers.
   agentic: boolean;
-  effort: "low" | "medium" | "high";
 }
 
 export function ChatScopePanel({
@@ -86,24 +86,9 @@ export function ChatScopePanel({
         </div>
         <p className="mt-1.5 text-xs text-muted-foreground">
           {scope.agentic
-            ? "Reframes your question, retrieves, reviews its own findings, and refines before answering. Slower, more thorough."
+            ? "Rewords your question, retrieves, evaluates its own findings, and looks deeper before answering. Slower, more thorough."
             : "One retrieval pass + one LLM call."}
         </p>
-        {scope.agentic && (
-          <div className="mt-2 flex flex-col gap-1.5">
-            <Label className="text-xs">Effort</Label>
-            <Select value={scope.effort} onValueChange={(v) => set("effort", v as ChatScope["effort"])}>
-              <SelectTrigger>
-                <SelectValue>{(v: string | null) => v ?? "high"}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="low">Low — single search, quick answer</SelectItem>
-                <SelectItem value="medium">Medium — reframe + one refinement pass</SelectItem>
-                <SelectItem value="high">High — full research loop (slowest, most thorough)</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-        )}
       </div>
 
       <Separator />
@@ -200,31 +185,62 @@ export function ChatScopePanel({
 
       <Separator />
 
-      <div className="flex flex-col gap-1.5">
-        <Label>Chat model</Label>
-        <Select
-          value={scope.chatModel || "__default__"}
-          onValueChange={(v) => set("chatModel", v === "__default__" || !v ? "" : v)}
-        >
-          <SelectTrigger>
-            <SelectValue>
-              {(v: string | null) =>
-                !v || v === "__default__" ? `Default${modelSettings ? ` (${modelSettings.chat_llm})` : ""}` : v
-              }
-            </SelectValue>
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="__default__">
-              Default {modelSettings ? `(${modelSettings.chat_llm})` : ""}
-            </SelectItem>
-            {system?.ollama.models.map((m) => (
-              <SelectItem key={m.name} value={m.name}>
-                {m.name} · {m.size_gb} GB
+      {scope.agentic ? (
+        // Agentic RAG's model is NOT a per-request choice like Simple RAG's chat
+        // model above -- it's one shared, cached LLM instance for the whole app
+        // (edenview_RAG.agentic_rag.config.get_shared_llm(), @lru_cache(maxsize=1)),
+        // and changing it always requires an API server restart (see
+        // api/routers/config.py's RESTART_REQUIRED_KEYS). Showing a picker here that
+        // silently did nothing per-request would be misleading -- this is an
+        // informational display + a link to where it's actually changed.
+        <div className="flex flex-col gap-1.5">
+          <Label>Agentic RAG model</Label>
+          {modelSettings ? (
+            <div className="flex flex-col gap-1 rounded-lg border border-dashed border-input px-2.5 py-2 text-xs text-muted-foreground">
+              <span>
+                Agent: <span className="text-foreground">{modelSettings.agent_model}</span>
+              </span>
+              <span>
+                Vision: <span className="text-foreground">{modelSettings.agent_vision_model ?? "inherits agent model, if supported"}</span>
+              </span>
+              <span>
+                Max iterations: <span className="text-foreground">{modelSettings.agent_max_iterations}</span>
+              </span>
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">Loading…</p>
+          )}
+          <Link href="/settings" className="text-xs text-primary hover:underline">
+            Change in Settings (needs a restart) →
+          </Link>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-1.5">
+          <Label>Chat model</Label>
+          <Select
+            value={scope.chatModel || "__default__"}
+            onValueChange={(v) => set("chatModel", v === "__default__" || !v ? "" : v)}
+          >
+            <SelectTrigger>
+              <SelectValue>
+                {(v: string | null) =>
+                  !v || v === "__default__" ? `Default${modelSettings ? ` (${modelSettings.chat_llm})` : ""}` : v
+                }
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__default__">
+                Default {modelSettings ? `(${modelSettings.chat_llm})` : ""}
               </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
+              {system?.ollama.models.map((m) => (
+                <SelectItem key={m.name} value={m.name}>
+                  {m.name} · {m.size_gb} GB
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
     </aside>
   );
 }

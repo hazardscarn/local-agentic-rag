@@ -108,6 +108,22 @@ def search(
     per_collection_limit = config.top_k if len(collection_names) == 1 else config.per_collection_candidates
 
     hits: list[RetrievalHit] = []
+    # chunk_id is deterministic on (file_hash, chunking_strategy, chunk_index) alone
+    # (edenview_ingestion/chunking/models.py's make_chunk_id()) and is used directly
+    # as the Qdrant point ID -- Qdrant only guarantees that ID is unique WITHIN one
+    # collection, not globally. If the same source document is ingested into two
+    # different collections under the same strategy (nothing prevents this --
+    # catalog/schema.py's collection_documents join table explicitly allows one doc
+    # in many collections), both collections produce chunks with the IDENTICAL
+    # chunk_id, and a query spanning both would otherwise return the same chunk_id
+    # twice in one hits list -- confirmed directly causing a real symptom: a React
+    # "duplicate key" warning where the frontend renders the same citation twice.
+    # Deduped here (first-seen wins, before reranking so a genuine duplicate never
+    # even costs a rerank call) rather than downstream, since every caller of
+    # search()/search_db() (Simple RAG's /chat, Agentic RAG's vector_search tool)
+    # should get a clean, duplicate-free hit list, not have to work around this
+    # collection-spanning ID collision individually.
+    seen_chunk_ids: set[str] = set()
     for name in collection_names:
         record = collection_records[name]
         # Each collection's own stored embedding_model, not config.yaml's current
@@ -119,10 +135,14 @@ def search(
         points = _query_one_collection(name, dense_vec, sparse_vec, per_collection_limit, query_filter)
         collection_id = record.collection_id if record is not None else None
         for point in points:
+            chunk_id = str(point.id)
+            if chunk_id in seen_chunk_ids:
+                continue
+            seen_chunk_ids.add(chunk_id)
             payload = point.payload or {}
             hits.append(
                 RetrievalHit(
-                    chunk_id=str(point.id),
+                    chunk_id=chunk_id,
                     score=point.score,
                     text=payload.get("text", ""),
                     context_text=_resolve_context_text(payload, collection_id),

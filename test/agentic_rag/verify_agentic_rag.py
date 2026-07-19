@@ -1,17 +1,23 @@
-"""Verification script for the agentic RAG "low" tier -- the single most important
-checkpoint in the whole agentic_rag build plan: proves LiteLlm + ollama_chat/<model> +
-ADK's FunctionTool schema generation + citation round-trip all work together, AND that
-DatabaseSessionService genuinely persists conversational memory across a process
-restart (not just within one process's lifetime).
+"""Verification script for the agentic RAG pipeline (one flat pipeline, no effort
+tiers -- see edenview_RAG/agentic_rag/agent.py). Proves LiteLlm + ollama_chat/<model>
++ ADK's FunctionTool schema generation + citation round-trip all work together, AND
+that DatabaseSessionService genuinely persists conversational memory across a process
+restart (not just within one process's lifetime) -- Root's own history is what
+resolves a follow-up like "the tax-year question I just asked" into a standalone
+question before calling query_pipeline (see prompts.ROOT_INSTRUCTION).
 
 Two phases, run as two SEPARATE OS processes (not subprocess-spawned from within one
 script) -- the embedded Qdrant/DuckDB store this project uses only tolerates one
 process holding it open at a time, so a real "does memory survive a restart" test
 needs the first process to fully exit before the second one starts.
 
+A real run through this pipeline can genuinely take several minutes (reworder +
+search + up to `agent.max_iterations` eval/deep-search rounds + answer formatting,
+per runtime.py::run_turn's own docstring) -- this is expected, not a hang.
+
 Usage:
-    PYTHONPATH=. venv/Scripts/python.exe test/agentic_rag/verify_agentic_rag_low.py --phase 1
-    PYTHONPATH=. venv/Scripts/python.exe test/agentic_rag/verify_agentic_rag_low.py --phase 2
+    PYTHONPATH=. venv/Scripts/python.exe test/agentic_rag/verify_agentic_rag.py --phase 1
+    PYTHONPATH=. venv/Scripts/python.exe test/agentic_rag/verify_agentic_rag.py --phase 2
 """
 
 from __future__ import annotations
@@ -28,28 +34,19 @@ import edenview_ingestion  # noqa: F401 -- must be imported before any docling.*
 
 from edenview_ingestion import catalog, pipeline
 
-# A standalone 30-page excerpt (pages 1-30 of the real Income Tax Act 2025 PDF,
-# covering the definitions chapter incl. VDA at section 111/page 25) -- NOT the full
-# 686-page original. Using a genuinely separate file (not extraction_config.page_range
-# on the full PDF) deliberately sidesteps a real caching gotcha found during
-# development: DoclingExtractor.extract()'s cache is keyed by filename and, on a hit,
-# ignores page_range entirely (a docstring-documented behavior, not a bug in this
-# script) -- an earlier, unrelated persist=True run had already cached a full parse of
-# the original file, silently reused a full 636-chunk/686-page document instead of the
-# requested 30, producing an accordingly-derailed test. A separate file has its own
+# Same standalone 30-page excerpt the old tiered verify scripts used (pages 1-30 of
+# the real Income Tax Act 2025 PDF, covering the definitions chapter) -- a genuinely
+# separate file (not extraction_config.page_range on the full PDF) deliberately
+# sidesteps a real caching gotcha: DoclingExtractor.extract()'s cache is keyed by
+# filename and, on a hit, ignores page_range entirely -- a separate file has its own
 # file_hash and can never collide with that (or any future) cache.
 SAMPLE_PDF = "data/Finance_act_mini/ITA2025_definitions_excerpt.pdf"
-DB_NAME = "verify-agentic-rag-low-db"
-COLLECTION = "verify-agentic-rag-low-v2"
-SESSION_ID_FILE = Path(__file__).parent / ".verify_low_session_id.tmp"
+DB_NAME = "verify-agentic-rag-db"
+COLLECTION = "verify-agentic-rag-v3"
+SESSION_ID_FILE = Path(__file__).parent / ".verify_session_id.tmp"
 
-# Note: the excerpt's hybrid_docling chunking merged 30 dense pages of numbered
-# clauses into only 10 chunks -- the specific VDA definition (page 25, item 111)
-# ended up merged/split away from a clean top-k hit (confirmed present in the source
-# text via a direct pypdfium2 text scan, so this is a chunking-granularity artifact of
-# this particular strategy on this document, not an agentic_rag bug). Using a
-# question the corpus's actual 10 chunks demonstrably cover instead (section 3's "tax
-# year" definition, confirmed present via a direct scroll of the collection).
+# Confirmed present in the excerpt's actual chunks (section 3's "tax year"
+# definition) -- not a question the corpus is silent on.
 QUERY_1 = "According to the Income Tax Act 2025, what does the term 'tax year' mean?"
 QUERY_2 = (
     "Following up on the 'tax year' definition I just asked about -- for a business "
@@ -95,7 +92,7 @@ def phase_1() -> int:
 
     print(f"\n[phase 1 -- turn 1, session_id={session_id}]")
     print(f"  query: {QUERY_1!r}")
-    answer, thinking, citations = asyncio.run(run_turn(QUERY_1, scope, "low", session_id))
+    answer, thinking, citations = asyncio.run(run_turn(QUERY_1, scope, session_id))
     print(f"  answer: {answer[:300]!r}")
     print(f"  citations: {len(citations)}")
 
@@ -125,13 +122,14 @@ def phase_2() -> int:
 
     print(f"\n[phase 2 -- turn 2 (fresh process), session_id={session_id}]")
     print(f"  query: {QUERY_2!r}")
-    answer, thinking, citations = asyncio.run(run_turn(QUERY_2, scope, "low", session_id))
+    answer, thinking, citations = asyncio.run(run_turn(QUERY_2, scope, session_id))
     print(f"  answer: {answer[:500]!r}")
     print(f"  citations: {len(citations)}")
 
     check("non-empty answer", bool(answer.strip()))
     check(
-        "answer engages with the tax-year/newly-set-up-business follow-up (not a generic/confused answer)",
+        "answer engages with the tax-year/newly-set-up-business follow-up (not a generic/confused answer) "
+        "-- proves Root's own persisted history resolved the follow-up before calling query_pipeline",
         any(term in answer.lower() for term in ["tax year", "twelve month", "newly set", "financial year"]),
         f"answer was: {answer[:200]!r}",
     )

@@ -43,10 +43,16 @@ def create_session(first_message: str, connection: duckdb.DuckDBPyConnection = N
     return ChatSessionRecord(session_id=session_id, title=_title_from_message(first_message), created_at=now, updated_at=now)
 
 
-def list_sessions(connection: duckdb.DuckDBPyConnection = None) -> list[ChatSessionRecord]:
+def list_sessions(connection: duckdb.DuckDBPyConnection = None, limit: int = 10, offset: int = 0) -> list[ChatSessionRecord]:
+    """Most-recently-updated-first. `limit`/`offset` back the sidebar's "last N +
+    Load more" pagination -- the caller (api/routers/chat.py) infers "there might be
+    more" simply from `len(result) == limit` (a full page came back), no separate
+    has-more flag or count query needed, matching this codebase's existing
+    lightweight pagination style (see GET /jobs)."""
     connection = connection or get_connection()
     rows = connection.execute(
-        "SELECT session_id, title, created_at, updated_at FROM chat_sessions ORDER BY updated_at DESC"
+        "SELECT session_id, title, created_at, updated_at FROM chat_sessions ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+        [limit, offset],
     ).fetchall()
     return [ChatSessionRecord(session_id=r[0], title=r[1], created_at=r[2], updated_at=r[3]) for r in rows]
 
