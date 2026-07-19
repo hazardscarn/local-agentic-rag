@@ -7,6 +7,13 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+# NOTE: lib/ and lib64/ are anchored to the project root (leading /) -- unanchored,
+# they match at any depth and were silently swallowing edenview-ui/src/lib/ (api.ts,
+# utils.ts, types.ts, pipeline-state.ts), which meant those files were NEVER actually
+# committed to git despite existing on disk here -- a fresh clone was missing them
+# outright ("Module not found: Can't resolve '@/lib/api'"). Root-anchoring is safe:
+# this project has no build-artifact lib/ at the root anyway (venv/ and build/ below
+# already cover the cases the unanchored pattern was meant for).
 .Python
 build/
 develop-eggs/
@@ -14,8 +21,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
