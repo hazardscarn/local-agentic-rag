@@ -155,6 +155,17 @@ ollama:
 # per-document storage (documents/ -- parse cache, picture/table crops, and preserved
 # original PDFs for visual grounding). Editable from Settings -> Workspace.
 #
+# Deliberately a RELATIVE path (resolved against the project root by
+# edenview_ingestion.settings._resolve_path() -- see get_workspace_root()), not an
+# absolute one. This file is committed and cloned by every installer, so an absolute
+# path here would bake one specific machine's own folder layout into the shared
+# package source -- on that same machine it can even resolve to a real, already
+# populated folder (e.g. a second local clone silently reusing the first's data
+# instead of starting fresh). A relative path always resolves to "wherever this
+# install actually lives," which is what a fresh clone needs by default. Set this to
+# an absolute path locally (via Settings -> Workspace) if you want your own data
+# outside the project folder -- just don't commit that value back here.
+#
 # IMPORTANT: set this once, right after installing, and don't change it casually --
 # every collection, chat session, and document you've ingested lives under this path.
 # Changing it here does NOT move that data; it just points a fresh process at a
@@ -165,7 +176,7 @@ ollama:
 # errors, or corruption on a dropped connection), since neither is designed to run its
 # storage over the network.
 workspace:
-  root: D:/Work/Github/local-agentic-rag/edenview_data
+  root: edenview_data
 
 # Extraction performance knobs -- both null by default, meaning "auto-detect from
 # whatever machine this is running on" rather than a value tuned to one dev machine
