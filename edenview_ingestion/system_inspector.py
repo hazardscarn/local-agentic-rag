@@ -126,7 +126,10 @@ def _detect_nvidia_gpus() -> list[GPUInfo]:
                 GPUInfo(name=name, vendor="nvidia", vram_total_mb=int(total_mb), vram_free_mb=int(free_mb))
             )
         except ValueError:
-            continue
+            # Unified-memory NVIDIA chips (e.g. Grace Blackwell "GB10" in DGX Spark /
+            # Jetson Thor devkits) report memory.total/memory.free as "[N/A]" -- there's
+            # no separate VRAM pool to query, same situation as Apple Silicon below.
+            gpus.append(GPUInfo(name=name, vendor="nvidia", unified_memory=True))
     return gpus
 
 
