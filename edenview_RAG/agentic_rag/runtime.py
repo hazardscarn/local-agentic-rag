@@ -105,29 +105,45 @@ def _reset_litellm_logging_worker() -> None:
 
 
 def _ordered_citations(session) -> list[RetrievalHit]:
-    """Builds the final citations list in the same order the answer's own
-    inline [N] markers use, via state["final_citation_order"] (the
-    {global_number: chunk_id} map callbacks.prepare_consolidated_findings
-    writes) -- so citations[N-1] in the API response really is the chunk
-    marker [N] in the answer text refers to. Required for the frontend's
-    clickable inline citations (chat-message.tsx) to jump to the right source.
-    Falls back to today's dict-insertion order if that key is absent -- e.g.
-    Simple RAG's non-agentic /chat path, which never runs this pipeline's
-    callbacks at all. Dict keys may come back as strings (JSON round-trip
-    through session persistence), hence `key=int` rather than assuming int."""
+    """Builds the final citations list in the same order the answer's own inline
+    [N] markers use -- required for the frontend's clickable inline citations
+    (chat-message.tsx's `citations[N-1]` lookup) to jump to the right source.
+
+    Prefers state["final_citation_order"] (a {normalized_position: chunk_id} map,
+    written by callbacks.finalize_answer -- registered as the researcher's
+    after_model_callback in agent.py) whenever it's present: finalize_answer only
+    sets it when it had to rewrite the answer's own citation markers (closing
+    gaps / fixing order), which is exactly when raw state["ref_to_chunk_id"]
+    (discovery order) and the markers actually printed in the answer diverge.
+    Falls back to ref_to_chunk_id directly when finalize_answer made no rewrite
+    (markers already matched discovery order 1:1, so it's equivalent) or never
+    ran at all -- e.g. Simple RAG's non-agentic /chat path, which never touches
+    this pipeline's callbacks. Falls back further to citations_raw's own dict-
+    insertion order if even that key is absent. final_citation_order's own keys are
+    always plain sequential positions ("1", "2", ...) regardless of ref format (see
+    finalize_answer), hence `key=int` there specifically -- but ref_to_chunk_id's
+    keys are the raw call-scoped ref strings tools.py assigns (e.g. "b.2", see
+    callbacks.merge_hits_into_state), not sortable as ints, so that fallback instead
+    relies on dict insertion order (Python 3.7+ guarantees this), which already
+    matches discovery order without needing an explicit sort."""
     if not session:
         return []
     citations_raw: dict = session.state.get("citations", {})
-    final_citation_order: dict = session.state.get("final_citation_order") or {}
-    if not final_citation_order:
+
+    def _resolve(chunk_id) -> RetrievalHit | None:
+        hit = citations_raw.get(str(chunk_id)) or citations_raw.get(chunk_id)
+        return RetrievalHit(**hit) if hit else None
+
+    final_order: dict = session.state.get("final_citation_order") or {}
+    if final_order:
+        return [h for pos in sorted(final_order, key=int) if (h := _resolve(final_order[pos]))]
+
+    ref_to_chunk_id: dict = session.state.get("ref_to_chunk_id") or {}
+    if not ref_to_chunk_id:
+        # Fallback for simple RAG or when harvest_citations didn't fire -- use
+        # direct dict insertion order of citations_raw.
         return [RetrievalHit(**d) for d in citations_raw.values()]
-    ordered = []
-    for number in sorted(final_citation_order, key=int):
-        chunk_id = final_citation_order[number]
-        hit = citations_raw.get(chunk_id)
-        if hit:
-            ordered.append(RetrievalHit(**hit))
-    return ordered
+    return [h for chunk_id in ref_to_chunk_id.values() if (h := _resolve(chunk_id))]
 
 
 async def _run_once(query: str, scope: RetrievalScope, session_id: str) -> tuple[str, str, list[RetrievalHit]]:
@@ -139,7 +155,17 @@ async def _run_once(query: str, scope: RetrievalScope, session_id: str) -> tuple
         user_id=_USER_ID,
         session_id=session_id,
         new_message=types.Content(role="user", parts=[types.Part(text=query)]),
-        state_delta={"scope": scope.model_dump(), "citations": {}, "sub_answers": [], "final_answer": ""},
+        state_delta={
+            "scope": scope.model_dump(),
+            "citations": {},
+            "final_answer": "",
+            # Explicitly reset researcher-accumulated keys that carry over from the
+            # previous turn's ADK session state (merge_hits_into_state writes these).
+            # Without this, a stale ref_to_chunk_id/_call_letter_count corrupts the
+            # researcher on a second+ agentic question in the same chat.
+            "ref_to_chunk_id": {},
+            "_call_letter_count": 0,
+        },
     ):
         if event.content and event.content.parts:
             thought = _extract_thought_text(event.content.parts)
@@ -230,7 +256,15 @@ async def _run_turn_and_push(query: str, scope: RetrievalScope, session_id: str,
             user_id=_USER_ID,
             session_id=session_id,
             new_message=types.Content(role="user", parts=[types.Part(text=query)]),
-            state_delta={"scope": scope.model_dump(), "citations": {}, "sub_answers": [], "final_answer": ""},
+            state_delta={
+                "scope": scope.model_dump(),
+                "citations": {},
+                "final_answer": "",
+                # Explicitly reset researcher-accumulated keys that carry over from the
+                # previous turn's ADK session state (merge_hits_into_state writes these).
+                "ref_to_chunk_id": {},
+                "_call_letter_count": 0,
+            },
         ):
             for call in event.get_function_calls() or []:
                 label = prompts.STATUS_LABELS.get(call.name, f"Working ({call.name})...")

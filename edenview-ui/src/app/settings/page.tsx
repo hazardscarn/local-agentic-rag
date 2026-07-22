@@ -22,7 +22,6 @@ import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Badge } from "@/components/ui/badge";
 import { ModelField } from "@/components/settings/model-field";
 import { AgentModelSelect } from "@/components/settings/agent-model-select";
 import { FieldHelp } from "@/components/shared/field-help";
@@ -157,6 +156,15 @@ export default function SettingsPage() {
   const hasChanges = Object.keys(diff).length > 0;
 
   const pulled = system?.ollama.models ?? [];
+  // Mirrors edenview_ingestion.settings.EMBEDDING_TOKENIZER_MAP -- an embedding model
+  // Ollama reports as capable isn't enough on its own, this app also needs a verified
+  // HuggingFace tokenizer for it (see that map's own comment for why: chunk
+  // token-budget sizing has to match what the embedder actually tokenizes). Filtering
+  // here means the dropdown only ever offers combinations that will actually save
+  // successfully, instead of failing at save time.
+  const embeddingModels = (capModels ?? []).filter(
+    (m) => m.capabilities.includes("embedding") && ["bge-m3", "granite-embedding", "qwen3-embedding"].includes(m.name.split(":")[0]),
+  );
 
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-6 px-8 py-10">
@@ -373,10 +381,24 @@ export default function SettingsPage() {
       <Card>
         <CardHeader>
           <CardTitle className="text-sm">Embedding & retrieval</CardTitle>
-          <CardDescription>Changing the embedding model without re-ingesting existing collections will break them — no auto-migration.</CardDescription>
+          <CardDescription>
+            Changing the embedding model without re-ingesting existing collections will break
+            them — no auto-migration. Only switch it if you know every collection you&apos;ll query
+            was ingested with that SAME model; querying with a different one than a collection was
+            built with silently returns bad/irrelevant results, not an error. After saving any
+            change here, restart the API server — some of these fields (tokenizer always follows
+            automatically) only take effect after a restart, not immediately.
+          </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-5">
-          <ModelField settingKey="dense_embedding" label="Dense embedding model" value={form.dense_embedding} onChange={(v) => set("dense_embedding", v)} pulledModels={pulled} />
+          <AgentModelSelect
+            settingKey="dense_embedding"
+            label="Dense embedding model"
+            capability="embedding"
+            value={form.dense_embedding}
+            onChange={(v) => set("dense_embedding", v)}
+            models={embeddingModels}
+          />
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center gap-1.5">
               <Label>Dense embedding dimension</Label>
@@ -395,7 +417,20 @@ export default function SettingsPage() {
           </div>
           <ModelField settingKey="sparse_embedding" label="Sparse (BM25) model" value={form.sparse_embedding} onChange={(v) => set("sparse_embedding", v)} />
           <ModelField settingKey="reranker" label="Reranker model" value={form.reranker} onChange={(v) => set("reranker", v)} />
-          <ModelField settingKey="tokenizer" label="Tokenizer" value={form.tokenizer} onChange={(v) => set("tokenizer", v)} />
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center gap-1.5">
+              <Label>Tokenizer</Label>
+              <FieldHelp>
+                Not independently editable — chunk token-budget sizing has to match what the dense
+                embedding model above actually tokenizes, so picking them separately risks a silent
+                mismatch. Saving a new dense embedding model automatically derives this from a
+                known-good mapping (only embedding models with a verified tokenizer are offered above).
+              </FieldHelp>
+            </div>
+            <p className="flex h-8 items-center rounded-lg border border-dashed border-input px-2.5 text-sm text-muted-foreground">
+              {form.tokenizer} (derived from {form.dense_embedding})
+            </p>
+          </div>
         </CardContent>
       </Card>
 
@@ -416,10 +451,10 @@ export default function SettingsPage() {
             <Bot className="size-4" /> Agentic RAG
           </CardTitle>
           <CardDescription>
-            The model driving the agentic pipeline&apos;s reword/search/eval/deep-search loop -- separate
-            from the chat model above, since Simple RAG and Agentic RAG are independently configurable.
-            Different hardware can run different models here; the dropdowns only list pulled models that
-            actually report the capability each field needs.
+            The model driving the agentic pipeline&apos;s researcher agent -- separate from the chat model
+            above, since Simple RAG and Agentic RAG are independently configurable. Different hardware can
+            run different models here; the dropdowns only list pulled models that actually report the
+            capability each field needs.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-5">
@@ -441,23 +476,6 @@ export default function SettingsPage() {
             allowUnset
             unsetLabel="Use agent model's vision, if supported"
           />
-          <div className="flex flex-col gap-1.5">
-            <div className="flex items-center gap-2">
-              <Label>Max refinement iterations</Label>
-              <Badge variant="secondary" className="text-[10px]">restart required</Badge>
-            </div>
-            <Input
-              type="number"
-              min={1}
-              value={form.agent_max_iterations}
-              onChange={(e) => set("agent_max_iterations", Number(e.target.value) || 1)}
-            />
-            <p className="text-xs text-muted-foreground">
-              How many reword/search/eval passes one sub-question&apos;s research loop can take before
-              giving up. The loop usually exits early once the eval step says the findings are enough --
-              this is just the ceiling.
-            </p>
-          </div>
         </CardContent>
       </Card>
 

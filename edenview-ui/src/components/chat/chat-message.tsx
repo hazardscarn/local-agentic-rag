@@ -133,7 +133,7 @@ export function ChatMessage({ turn, onViewSource }: { turn: ChatTurn; onViewSour
         {turn.citations && turn.citations.length > 0 && (
           <div className="flex w-full gap-2 overflow-x-auto pb-1">
             {turn.citations.map((hit, i) => (
-              <CitationCard key={hit.chunk_id} index={i + 1} hit={hit} onViewSource={onViewSource} />
+              <CitationCard key={`${hit.chunk_id}-${i}`} index={i + 1} hit={hit} onViewSource={onViewSource} />
             ))}
           </div>
         )}

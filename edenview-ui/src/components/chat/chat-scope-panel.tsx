@@ -108,9 +108,16 @@ export function ChatScopePanel({
         </div>
         <p className="mt-1.5 text-xs text-muted-foreground">
           {scope.agentic
-            ? "Rewords your question, retrieves, evaluates its own findings, and looks deeper before answering. Slower, more thorough."
+            ? "Searches multiple angles in parallel, digs deeper on promising findings, and answers directly from the evidence. Slower, more thorough."
             : "One retrieval pass + one LLM call."}
         </p>
+        {scope.agentic && (
+          <p className="mt-1 text-xs text-muted-foreground/70">
+            Smaller agent models can occasionally mislabel an inline [N] citation.
+            Every source it actually used is still listed at the bottom of the
+            answer either way.
+          </p>
+        )}
       </div>
 
       <Separator />
@@ -224,9 +231,6 @@ export function ChatScopePanel({
               </span>
               <span>
                 Vision: <span className="text-foreground">{modelSettings.agent_vision_model ?? "inherits agent model, if supported"}</span>
-              </span>
-              <span>
-                Max iterations: <span className="text-foreground">{modelSettings.agent_max_iterations}</span>
               </span>
             </div>
           ) : (

@@ -40,7 +40,6 @@ RESTART_REQUIRED_KEYS = {
     # require_tool_calling_model() runs once at agent.py's own module import time.
     "agent_model",
     "agent_vision_model",
-    "agent_max_iterations",
 }
 
 
@@ -69,6 +68,27 @@ def update_config(body: UpdateModelSettingsRequest):
             raise HTTPException(
                 400, f"Could not reach Ollama to detect {updates['dense_embedding']!r}'s dimension: {e}"
             ) from e
+
+    # tokenizer is never independently editable -- always derived from dense_embedding
+    # (see settings.tokenizer_for_dense_embedding's own docstring: chunk token-budget
+    # sizing has to match what the embedding model itself actually tokenizes, so the
+    # two can never be picked separately without risking a silent mismatch). Rejects
+    # a dense_embedding this app has no verified tokenizer for, same "fail loudly at
+    # save time" reasoning as agent_model below, rather than letting a user save an
+    # unsupported embedding model and only notice ingestion/chunking behaving oddly
+    # later. A standalone "tokenizer" in the request (no dense_embedding change
+    # alongside it) is rejected outright -- there's no longer a UI field for it.
+    if "dense_embedding" in updates:
+        matched = settings.tokenizer_for_dense_embedding(updates["dense_embedding"])
+        if matched is None:
+            raise HTTPException(
+                400,
+                f"{updates['dense_embedding']!r} has no known matching tokenizer -- "
+                "supported dense embedding models: " + ", ".join(sorted(settings.EMBEDDING_TOKENIZER_MAP)),
+            )
+        updates["tokenizer"] = matched
+    elif "tokenizer" in updates:
+        raise HTTPException(400, "tokenizer is derived from dense_embedding, not independently editable")
 
     # agent_model has no reasonable degraded mode (same reasoning as
     # edenview_RAG.agentic_rag.config.require_tool_calling_model(), which this

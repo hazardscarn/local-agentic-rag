@@ -171,7 +171,6 @@ class ModelSettings(BaseModel):
     # this field's raw value feeds (edenview_ingestion.settings does NOT replicate
     # that fallback -- only the raw config.yaml read).
     agent_vision_model: Optional[str] = None
-    agent_max_iterations: int
 
 
 class UpdateModelSettingsRequest(BaseModel):
@@ -194,7 +193,6 @@ class UpdateModelSettingsRequest(BaseModel):
     ollama_keep_alive: Optional[str] = None
     agent_model: Optional[str] = None
     agent_vision_model: Optional[str] = None
-    agent_max_iterations: Optional[int] = None
 
     @field_validator("agent_vision_model", mode="before")
     @classmethod

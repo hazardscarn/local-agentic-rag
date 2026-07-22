@@ -50,10 +50,6 @@ def get_vision_model() -> Optional[str]:
     return model if model_supports_capability(model, "vision", get_ollama_host()) else None
 
 
-def get_max_iterations() -> int:
-    return int(load_config().get("agent", {}).get("max_iterations", 4))
-
-
 def require_tool_calling_model() -> None:
     """Called once at agent-tree build time (agent.py, module import) -- fails
     loudly and immediately if the configured `agent.model` can't tool-call, rather
@@ -114,41 +110,7 @@ def get_shared_llm() -> LiteLlm:
     call loops and ignoring previous context."."""
     model = get_agent_model_name()
     _register_ollama_model_with_litellm(model)
-    return LiteLlm(model=f"ollama_chat/{model}", num_ctx=get_agent_num_ctx())
-
-
-@lru_cache(maxsize=1)
-def get_reword_llm() -> LiteLlm:
-    """Same underlying model/num_ctx as get_shared_llm() -- NOT a second resident
-    model (see that function's docstring for why a second model is a real VRAM risk
-    on this project's 6GB budget) -- but with native "thinking" explicitly disabled
-    via litellm's `reasoning_effort` param (confirmed directly: litellm's
-    ollama_chat transformation maps `reasoning_effort` to Ollama's own `think` field,
-    `value in {"low","medium","high"}` -- passing "none" is what forces `think:
-    false` in the actual Ollama request, omitting the param entirely leaves Ollama's
-    own default of "think if the model can" in place).
-
-    Reworder is a rewrite/split task, not multi-step reasoning, yet a direct
-    same-model smoke test (reasoning_effort unset vs "none", identical prompt)
-    showed the default burning 10,073 chars of thinking against only 58 chars of
-    real output -- a ~173:1 ratio -- while reasoning_effort="none" produced 2,312
-    chars of real output and zero thinking. Confirmed against the real pipeline via
-    test/agentic_rag/verify_live_status.py: reworder alone accounted for 90+ of a
-    ~220s single-pass turn. Eval is deliberately NOT given this treatment -- grading
-    whether multi-part findings are actually sufficient benefits from real
-    deliberation, and eval's own thinking hasn't shown the same near-total-waste
-    pattern reworder's did.
-
-    answer_formatter was also tried on this (thinking off, to reclaim num_ctx budget
-    for a multi-part question's final answer) but reverted -- confirmed by direct
-    reproduction that synthesizing several sub-questions' worth of real research into
-    one coherent answer is genuine integration/judgment work, and without thinking it
-    flattened its richest, most relevant sub-answer into one vague sentence. See
-    agent.py's answer_formatter definition for the full story; it uses get_shared_llm()
-    (thinking on) again, relying on agent.num_ctx=32768 for headroom instead."""
-    model = get_agent_model_name()
-    _register_ollama_model_with_litellm(model)
-    return LiteLlm(model=f"ollama_chat/{model}", num_ctx=get_agent_num_ctx(), reasoning_effort="none")
+    return LiteLlm(model=f"ollama_chat/{model}", num_ctx=get_agent_num_ctx(), max_tokens=16000)
 
 
 class RetrievalScope(BaseModel):

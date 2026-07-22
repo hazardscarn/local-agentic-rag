@@ -130,12 +130,8 @@ export interface AgenticStatusEvent {
   phase?: "start" | "end";
   message?: string;
   duration_s?: number | null;
-  // Only present for events belonging to a sub-question's own research (reworder,
-  // search_executor, eval, deep_search, and their tool calls) -- see
-  // edenview_RAG.agentic_rag.callbacks._subquestion_context(). Lets the live
-  // pipeline panel group repeating node names (the same agent fires once per loop
-  // iteration, per sub-question) into the correct independent research thread,
-  // instead of overwriting a flat per-node-name map.
+  // For the unified researcher architecture -- shows the actual search query text.
+  query?: string;
   subquestion_index?: number;
   subquestion_total?: number;
   subquestion_text?: string;
@@ -230,7 +226,6 @@ export interface ModelSettings {
   // null means "reuse agent_model if it's vision-capable, else unavailable" -- see
   // edenview_RAG.agentic_rag.config.get_vision_model()'s fallback logic.
   agent_vision_model: string | null;
-  agent_max_iterations: number;
 }
 
 export interface UpdateModelSettingsResponse {
@@ -292,5 +287,4 @@ export const RESTART_REQUIRED_KEYS = new Set([
   "reranker",
   "agent_model",
   "agent_vision_model",
-  "agent_max_iterations",
 ]);

@@ -98,16 +98,38 @@ def get_agent_vision_model() -> Optional[str]:
     return load_config().get("agent", {}).get("vision_model")
 
 
-def get_agent_max_iterations() -> int:
-    return int(load_config().get("agent", {}).get("max_iterations", 3))
-
-
 # API-facing flat key -> its real name under config.yaml's `agent:` section.
 AGENT_KEY_MAP = {
     "agent_model": "model",
     "agent_vision_model": "vision_model",
-    "agent_max_iterations": "max_iterations",
 }
+
+# Every dense_embedding model this app knows a matching HuggingFace tokenizer for --
+# keyed by the Ollama model name's family (the part before ":", so a size/tag suffix
+# like ":567m" or ":latest" doesn't need its own entry as long as that family shares
+# one tokenizer across sizes -- true for every family below). Verified directly, not
+# guessed: each of these downloads and loads successfully via transformers'
+# AutoTokenizer.from_pretrained (google/embeddinggemma-300m was tried and excluded --
+# it's a gated HF repo requiring separate license acceptance + an HF token, too
+# fragile to auto-download here even though Ollama reports the model itself as
+# embedding-capable). Chunk token-budget sizing (HybridChunker) has to match what the
+# embedding model itself actually tokenizes, so tokenizer is never an independent user
+# choice -- see api/routers/config.py's update_config(), which derives it from
+# whichever dense_embedding is selected via this map, and rejects any dense_embedding
+# this map doesn't cover rather than leaving a stale/mismatched tokenizer in place.
+EMBEDDING_TOKENIZER_MAP: dict[str, str] = {
+    "bge-m3": "BAAI/bge-m3",
+    "granite-embedding": "ibm-granite/granite-embedding-278m-multilingual",
+    "qwen3-embedding": "Qwen/Qwen3-Embedding-0.6B",
+}
+
+
+def tokenizer_for_dense_embedding(dense_embedding: str) -> Optional[str]:
+    """Looks up EMBEDDING_TOKENIZER_MAP by model family (everything before the first
+    ':' in an Ollama model name, e.g. "bge-m3" from "bge-m3:567m") -- None if this
+    dense_embedding isn't one of the models this app has a verified tokenizer for."""
+    family = dense_embedding.split(":", 1)[0]
+    return EMBEDDING_TOKENIZER_MAP.get(family)
 
 
 @lru_cache(maxsize=8)
@@ -274,7 +296,6 @@ def get_all_model_settings() -> dict:
     settings["ollama_keep_alive"] = get_ollama_keep_alive()
     settings["agent_model"] = get_agent_model()
     settings["agent_vision_model"] = get_agent_vision_model()
-    settings["agent_max_iterations"] = get_agent_max_iterations()
     return settings
 
 

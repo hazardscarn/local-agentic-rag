@@ -43,7 +43,7 @@ def _scope(tool_context: ToolContext) -> RetrievalScope:
         ) from None
 
 
-def _format_hits_for_llm(hits: list[RetrievalHit]) -> str:
+def _format_hits_for_llm(hits: list[RetrievalHit], ref_by_chunk_id: dict[str, str]) -> str:
     """Plain numbered-text block -- deliberately mirrors
     edenview_RAG/retrieval/generate.py's `_format_context()` exactly (the proven-
     working format today's non-agentic /chat already feeds a small local model), not
@@ -53,18 +53,32 @@ def _format_hits_for_llm(hits: list[RetrievalHit]) -> str:
     response as "data to process/describe" rather than "context to answer from". A
     single plain-text block reads the same to the model whether it arrives via a
     tool response or directly in a prompt, matching the one style already confirmed
-    to work well in this codebase."""
-    return "\n\n".join(f"[{i}] {hit.context_text}" for i, hit in enumerate(hits, start=1))
+    to work well in this codebase.
+
+    `ref_by_chunk_id` MUST be the same call-scoped {chunk_id: ref} refs the final
+    citations array is built from (see vector_search below) -- real, reproduced bug
+    fixed here: this used to number every call's own snippets locally from 1,
+    restarting at [1] on every one of the 3-5 parallel vector_search calls the
+    researcher fires per turn (see RESEARCHER_INSTRUCTION's Phase 2). The model had
+    no way to tell one call's "[1]" from another's, so whatever it cited in its
+    answer routinely resolved to a different chunk than the one it actually meant --
+    citations pointing at unrelated content on nearly every multi-query turn, which
+    is the normal case, not an edge case. Refs are now call-scoped strings like
+    "b.2" (letter = which call, number = position within that call's own results) --
+    see callbacks.merge_hits_into_state's _next_call_letter for why: giving the
+    model an anchor for "which batch of results is this" measurably cut down on it
+    grabbing a stale ref from an earlier topic while writing about a later one."""
+    return "\n\n".join(f"[{ref_by_chunk_id[hit.chunk_id]}] {hit.context_text}" for hit in hits if hit.chunk_id in ref_by_chunk_id)
 
 
-def _resolve_ref(ref: int, tool_context: ToolContext) -> Optional[dict]:
-    """Resolves a `ref` (the [N] number the model already sees next to a finding in
-    `{findings}`) back to the full RetrievalHit-json dict a prior vector_search call
-    stashed in state["citations"], via state["ref_to_chunk_id"] (both written by
-    callbacks.merge_hits_into_state). Every Deep Search tool below takes `ref`, never
-    a raw chunk_id/file_hash -- the model was never shown a chunk_id, only the [N]
-    number, so asking it to transcribe an ID it never saw would be a real
-    transcription-fidelity risk on a small local model."""
+def _resolve_ref(ref: str, tool_context: ToolContext) -> Optional[dict]:
+    """Resolves a `ref` (the call-scoped [b.2]-style ref the model already sees next
+    to a finding, see callbacks.merge_hits_into_state) back to the full
+    RetrievalHit-json dict a prior tool call stashed in state["citations"], via
+    state["ref_to_chunk_id"] (both written by merge_hits_into_state). Every Deep
+    Search tool below takes `ref`, never a raw chunk_id/file_hash -- the model was
+    never shown a chunk_id, only its ref string, so asking it to transcribe an ID it
+    never saw would be a real transcription-fidelity risk on a small local model."""
     chunk_id = tool_context.state.get("ref_to_chunk_id", {}).get(ref)
     if chunk_id is None:
         return None
@@ -108,9 +122,12 @@ def vector_search(query: str, tool_context: ToolContext) -> dict:
     Always runs the full hybrid retrieval pipeline (dense + sparse + reranking), so
     there is no separate "quality" toggle to worry about.
 
-    Returns numbered snippets ordered from MOST to LEAST relevant (snippet [1] is
-    the best match) -- cite them in your answer using their number, like [1] or
-    [2][3]. Returns {"status": "no_results", "snippets": ""} if nothing matched."""
+    Returns numbered snippets ordered from MOST to LEAST relevant -- cite them in
+    your answer using the exact ref shown next to each, e.g. [c.1] or [b.2][d.4].
+    Each ref's LETTER identifies which search call found it (this call's own hits
+    all share one letter) and the number is its rank within that call -- a chunk
+    found again by a later call keeps its ORIGINAL ref, never gets a second one.
+    Returns {"status": "no_results", "snippets": ""} if nothing matched."""
     scope = _scope(tool_context)
     config = RetrievalConfig(top_k=scope.top_k, use_reranker=True)  # always reranked, not agent-gated
     hits = (
@@ -118,27 +135,54 @@ def vector_search(query: str, tool_context: ToolContext) -> dict:
         if scope.collection_names
         else search_db(scope.db_name, query, config, scope.file_hashes, scope.strategy)
     )
+    if not hits:
+        return {"status": "no_results", "snippets": ""}
+
+    # Assign each hit its call-scoped citation ref SYNCHRONOUSLY, before building the
+    # response text below -- real, reproduced bug fixed here: this used to only stash
+    # raw hit data for callbacks.harvest_citations to number AFTER this call returns
+    # (see _format_hits_for_llm's docstring), so the snippets shown to the model here
+    # were numbered locally (always restarting at [1]) while the citations array the
+    # frontend renders used a different, global numbering -- the two only ever agreed
+    # by accident. merge_hits_into_state is safe to call directly here (its own
+    # docstring: accepts a ToolContext.state same as a plain dict) and is idempotent
+    # -- harvest_citations calling it again below via temp:last_hits on the same
+    # hits is a no-op (already_had already covers them), kept only so any other
+    # future consumer of temp:last_hits still sees these hits.
+    from . import callbacks as _callbacks
+
+    new_hits = {h.chunk_id: h.model_dump(mode="json") for h in hits}
+    _callbacks.merge_hits_into_state(tool_context.state, new_hits)
+    ref_to_chunk_id: dict = tool_context.state.get("ref_to_chunk_id", {})
+    ref_by_chunk_id = {chunk_id: ref for ref, chunk_id in ref_to_chunk_id.items()}
+
     # Full hit data (collection_name/strategy/headings/bbox/images -- everything the
     # frontend's citation display needs, but the LLM doesn't) stashed under a temp:
     # key for callbacks.harvest_citations to pick up right after this call returns --
     # kept out of the LLM-visible response below entirely.
-    tool_context.state["temp:last_hits"] = {h.chunk_id: h.model_dump(mode="json") for h in hits}
-    if not hits:
-        return {"status": "no_results", "snippets": ""}
-    return {"status": "ok", "snippets": _format_hits_for_llm(hits)}
+    tool_context.state["temp:last_hits"] = new_hits
+    return {"status": "ok", "snippets": _format_hits_for_llm(hits, ref_by_chunk_id)}
 
 
-def get_pages_detailed(ref: int, include_adjacent: bool, tool_context: ToolContext) -> dict:
+def get_pages_detailed(ref: str, include_adjacent: bool, tool_context: ToolContext) -> dict:
     """Reconstructs a finding's full page text from every chunk on that page, for
     when a finding's snippet looks cut off or you need more surrounding context than
-    the snippet alone gives. `ref` is the [N] reference number of the finding whose
-    page you want (e.g. pass 3 for finding [3]) -- not a file name or page number
+    the snippet alone gives. `ref` is the ref string of the finding whose page you
+    want (e.g. pass "a.3" for finding [a.3]) -- not a file name or page number
     yourself, the tool looks those up from the finding automatically. Set
     include_adjacent=True to also pull the page immediately before and after.
 
-    Returns {"status": "ok", "ref": ref, "text": "..."}, or {"status": "invalid_ref"}
-    if `ref` doesn't match a real finding, or {"status": "no_page"} if that finding
-    has no page number recorded."""
+    If include_adjacent pulls in a page OTHER than finding [ref]'s own, that page is
+    registered as a NEW finding with its own ref -- the response's `new_refs` maps
+    each extra page number to its new ref. Cite facts that come specifically from an
+    adjacent page using THAT page's own new ref, not the original `ref` -- `ref`'s
+    citation only points at its own page, so reusing it for an adjacent page's
+    content would point the reader at the wrong page.
+
+    Returns {"status": "ok", "ref": ref, "text": "...", "new_refs": {"6": "c.1"}}
+    (new_refs omitted when include_adjacent found nothing beyond ref's own page), or
+    {"status": "invalid_ref"} if `ref` doesn't match a real finding, or {"status":
+    "no_page"} if that finding has no page number recorded."""
     hit = _resolve_ref(ref, tool_context)
     if hit is None:
         return {"status": "invalid_ref", "ref": ref}
@@ -147,15 +191,73 @@ def get_pages_detailed(ref: int, include_adjacent: bool, tool_context: ToolConte
     points = _scroll_page_points(hit["file_hash"], hit["collection_name"], hit["page_no"], include_adjacent)
     if not points:
         return {"status": "no_results", "ref": ref, "text": ""}
+
     text = "\n\n".join(p.payload.get("text", "") for p in points)
-    return {"status": "ok", "ref": ref, "text": text}
+    result: dict = {"status": "ok", "ref": ref, "text": text}
+    if not include_adjacent:
+        return result
+
+    # Register any OTHER page actually pulled in (include_adjacent can reach the
+    # page before/after) as its own new citable finding -- one real chunk per extra
+    # page is enough to anchor a citation at that page. ref's own page is already
+    # covered by ref itself, skipped here. Real bug this fixes: without a NEW ref,
+    # the model had no way to cite adjacent-page content except by reusing `ref`,
+    # whose citation card points only at ref's own page -- clicking it then landed
+    # on the wrong page for any fact actually drawn from the adjacent one.
+    other_page_anchor: dict[int, object] = {}
+    for p in points:
+        page_no = p.payload.get("page_no")
+        if page_no is not None and page_no != hit["page_no"] and page_no not in other_page_anchor:
+            other_page_anchor[page_no] = p
+    if not other_page_anchor:
+        return result
+
+    from . import callbacks as _callbacks  # local import: tools.py has no other reason to import callbacks
+
+    new_hits: dict[str, dict] = {}
+    chunk_id_by_page: dict[int, str] = {}
+    for page_no, point in other_page_anchor.items():
+        chunk_id = str(point.id)
+        payload = point.payload or {}
+        new_hits[chunk_id] = {
+            "chunk_id": chunk_id,
+            "score": 1.0,
+            "text": payload.get("text", ""),
+            "context_text": payload.get("text", ""),
+            "collection_name": hit["collection_name"],
+            "strategy": payload.get("strategy", ""),
+            "kind": payload.get("kind", "text"),
+            "page_no": page_no,
+            "bbox": payload.get("bbox"),
+            "headings": payload.get("headings") or [],
+            "doc_stem": payload.get("doc_stem", hit.get("doc_stem", "")),
+            "file_hash": payload.get("file_hash", hit["file_hash"]),
+            "images": payload.get("images") or [],
+        }
+        chunk_id_by_page[page_no] = chunk_id
+
+    # Synchronous, same reasoning as vector_search's own direct merge_hits_into_state
+    # call: the new ref numbers must exist before this function returns, since this
+    # IS the response the model reads to learn them -- there's no later callback
+    # stage left to inject them into.
+    _callbacks.merge_hits_into_state(tool_context.state, new_hits)
+    ref_to_chunk_id: dict = tool_context.state.get("ref_to_chunk_id", {})
+    chunk_id_to_ref = {v: k for k, v in ref_to_chunk_id.items()}
+    new_refs = {
+        str(page_no): chunk_id_to_ref[chunk_id]
+        for page_no, chunk_id in chunk_id_by_page.items()
+        if chunk_id in chunk_id_to_ref
+    }
+    if new_refs:
+        result["new_refs"] = new_refs
+    return result
 
 
-def get_images(ref: int, tool_context: ToolContext) -> dict:
+def get_images(ref: str, tool_context: ToolContext) -> dict:
     """Looks for pictures, tables, or figures on a finding's page -- use this when a
     finding's page might contain a chart/table/figure with information the snippet's
-    text doesn't cover. `ref` is the [N] reference number of the finding whose page
-    to check (e.g. pass 3 for finding [3]). Every image found on that page is
+    text doesn't cover. `ref` is the ref string of the finding whose page
+    to check (e.g. pass "a.3" for finding [a.3]). Every image found on that page is
     returned once each, even if multiple findings on the same page reference the
     same image.
 
@@ -183,7 +285,7 @@ def get_images(ref: int, tool_context: ToolContext) -> dict:
     return {"status": "ok", "ref": ref, "images": images}
 
 
-def grep(ref: int, pattern: str, regex: bool, tool_context: ToolContext) -> dict:
+def grep(ref: str, pattern: str, regex: bool, tool_context: ToolContext) -> dict:
     """Searches for the EXACT, literal text of `pattern` within the one document a
     finding came from -- use this only when you need a specific term, section
     number, defined phrase, or figure verbatim, and a finding's snippet doesn't show
@@ -191,8 +293,8 @@ def grep(ref: int, pattern: str, regex: bool, tool_context: ToolContext) -> dict
     document it correctly identified as relevant). This is NOT a better version of
     search -- it only looks within the single document `ref` points to, never the
     whole document collection, and it only finds literal text, not related concepts.
-    `ref` is the [N] reference number of the finding whose document to search (e.g.
-    pass 3 for finding [3]). Set regex=True to treat `pattern` as a regular
+    `ref` is the ref string of the finding whose document to search (e.g.
+    pass "a.3" for finding [a.3]). Set regex=True to treat `pattern` as a regular
     expression instead of literal text; case-insensitive either way.
 
     Returns {"status": "ok", "ref": ref, "matches": ["...surrounding text...", ...]}
@@ -230,7 +332,7 @@ def grep(ref: int, pattern: str, regex: bool, tool_context: ToolContext) -> dict
     return {"status": "ok", "ref": ref, "matches": matches}
 
 
-async def get_answer_from_images(ref: int, question: str, tool_context: ToolContext) -> dict:
+async def get_answer_from_images(ref: str, question: str, tool_context: ToolContext) -> dict:
     """Asks a focused question directly against the picture(s)/table(s) found by
     get_images for the SAME `ref` -- call get_images first to confirm images exist
     on that page. Makes its own separate call to a vision-capable model, so ask one
@@ -282,7 +384,7 @@ async def get_answer_from_images(ref: int, question: str, tool_context: ToolCont
 
 
 async def get_answer_from_detailed_pages(
-    ref: int, question: str, include_adjacent: bool, tool_context: ToolContext
+    ref: str, question: str, include_adjacent: bool, tool_context: ToolContext
 ) -> dict:
     """Asks a focused question directly against a finding's full page text (same
     page get_pages_detailed would return for this `ref`) instead of you reading the
