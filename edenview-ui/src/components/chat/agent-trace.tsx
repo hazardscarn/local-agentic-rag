@@ -9,7 +9,8 @@ import type { NodeRun, PipelineState, SubquestionThread } from "@/lib/pipeline-s
 // AGENT_STATUS_LABELS/STATUS_LABELS so this reads the same as the single-line status
 // text elsewhere in the chat UI.
 const NODE_LABELS: Record<string, string> = {
-  decompose: "Understanding your question",
+  researcher: "Researching your question",
+  decompose: "Understanding the question",
   reworder: "Trying a different search phrasing",
   search_executor: "Searching your documents",
   vector_search: "Vector search",
@@ -93,6 +94,41 @@ function ThreadCard({ thread }: { thread: SubquestionThread }) {
 // as of this component's introduction, inside a completed chat message's own
 // collapsible "reasoning trace" disclosure (see chat-message.tsx).
 export function AgentTrace({ state }: { state: PipelineState }) {
+  // NEW architecture: check for researcher first (takes priority over legacy fields)
+  if (state.researcher) {
+    return (
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center gap-2 text-sm">
+          <StatusIcon status={state.researcher.status} />
+          <span className="flex-1 truncate">{label("researcher")}</span>
+          {state.researcher.status === "done" && state.researcher.duration_s != null && (
+            <span className="shrink-0 text-xs text-muted-foreground">{state.researcher.duration_s.toFixed(1)}s</span>
+          )}
+        </div>
+        {/* Show tool calls as children under researcher */}
+        {state.researcher.children.length > 0 && (
+          <div className="flex flex-col gap-1 ml-5 border-l border-border pl-3">
+            {state.researcher.children.map((child, i) => {
+              const displayText = child.node === "vector_search" && child.message
+                ? // Extract query from "Searching: '...'" or "Search complete: '...'"
+                  child.message.replace(/^Search(?:ing| complete): /, "")
+                : label(child.node);
+              return (
+                <div key={`tool-${i}`} className="flex items-center gap-2 text-xs py-0.5">
+                  <StatusIcon status={child.status} />
+                  <span className="flex-1 truncate font-mono text-muted-foreground">{displayText}</span>
+                  {child.duration_s != null && (
+                    <span className="shrink-0 text-xs text-muted-foreground/60">{child.duration_s.toFixed(1)}s</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  }
+
   const isEmpty = !state.decompose && state.threads.length === 0 && !state.answerFormatter;
   if (isEmpty) {
     return <p className="text-xs text-muted-foreground">{state.rootMessage ?? "Waiting to start…"}</p>;

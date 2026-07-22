@@ -6,16 +6,19 @@
 models:
   # Token-counting tokenizer for HybridChunker-based strategies (hybrid_docling,
   # parent_child, contextual) -- not an embedding model itself, just used to size
-  # chunks in tokens. Kept aligned to the dense embedding model below (same model =
-  # this is no longer a placeholder, chunk token budgets now match what the embedder
-  # actually sees).
+  # chunks in tokens. NOT an independent choice: always derived from dense_embedding
+  # below via edenview_ingestion.settings.EMBEDDING_TOKENIZER_MAP, so chunk token
+  # budgets always match what the embedder actually sees -- api/routers/config.py's
+  # update_config() overwrites this automatically whenever dense_embedding changes
+  # (and rejects a dense_embedding it has no verified tokenizer mapping for), so
+  # editing this key by hand only makes sense if you're editing dense_embedding too.
   tokenizer: BAAI/bge-m3
 
   # Dense embedding model, served via Ollama. Chosen over qwen3-embedding:0.6b (the
   # edenview_plan.md default) because it's already proven end-to-end in
   # ingest/shared.py (dense+sparse+RRF hybrid), already pulled, fits the 6GB VRAM
   # budget, and doubles as the tokenizer above -- one model instead of two to track.
-  dense_embedding: bge-m3
+  dense_embedding: bge-m3:567m
   dense_embedding_dim: 1024
 
   # Sparse (BM25) embedding model via FastEmbed, ONNX/CPU-only -- no GPU/VRAM cost.
@@ -32,7 +35,7 @@ models:
   # jobs (context-sentence generation at ingest time vs. answering a user's question
   # at query time) and are independently overridable from the Settings UI, even
   # though they default to the same model today for the same 6GB VRAM budget reason.
-  chat_llm: qwen3.5:2b
+  chat_llm: gemma4:31b
 
   # Ollama's actual runtime context window for chat_llm -- same real bug as
   # agent.num_ctx below (see that key's comment for the full story): Ollama's
@@ -60,7 +63,7 @@ models:
   # in VRAM with the dense embedder during ingestion (6GB budget, see
   # rag_vector_db_ingestion_plan.md). Not yet pulled locally as of this writing -- run
   # `ollama pull qwen3-vl:2b` before enabling do_picture_description=True.
-  picture_description_llm: qwen3-vl:2b
+  picture_description_llm: qwen3.5:2b
 
   # Cross-encoder reranker via FastEmbed, ONNX/CPU-only -- no GPU cost, same story as
   # sparse_embedding above. Scores (query, chunk) pairs on a comparable absolute-ish
@@ -71,9 +74,9 @@ models:
 
 agent:
   # Ollama chat model driving every LLM node of the agentic RAG pipeline
-  # (edenview_RAG/agentic_rag: reworder, search_executor, eval, deep_search,
-  # answer_formatter, root) -- a separate key from models.chat_llm since Simple RAG
-  # and Agentic RAG are independently overridable modes. MUST be tool-calling-capable
+  # (edenview_RAG/agentic_rag: researcher, root) -- a separate key from
+  # models.chat_llm since Simple RAG and Agentic RAG are independently overridable
+  # modes. MUST be tool-calling-capable
   # -- checked at runtime via `ollama show <model>`'s reported `capabilities` list
   # (require_tool_calling_model()), not assumed; the agent fails to build at all,
   # loudly, if this model can't tool-call, since there's no reasonable degraded mode
@@ -121,15 +124,6 @@ agent:
   # a constrained VRAM budget; GET /system/info reports available VRAM if you want
   # to check before committing to two resident models.
   vision_model:
-  # Hard cap on the refinement loop's iterations -- the loop is expected to usually
-  # exit early (Eval signals sufficient), this is just the ceiling so a weak local
-  # model can't get stuck looping forever. 3, not 4: each iteration already runs a
-  # full reword+search+eval+deep_search cycle, so by iteration 2 the loop has already
-  # re-worded once AND dug deeper once -- a 3rd iteration is a reasonable safety
-  # margin beyond that; a real test run that never reached `sufficient` burned an
-  # entire additional ~106s on a 4th iteration without resolving anything (see
-  # test/agentic_rag/verify_live_status.py), so 4 was more headroom than useful.
-  max_iterations: 3
 
 ollama:
   host: http://localhost:11434
@@ -176,7 +170,7 @@ ollama:
 # errors, or corruption on a dropped connection), since neither is designed to run its
 # storage over the network.
 workspace:
-  root: edenview_data
+  root: /home/davidacad10/Documents/edenview-local
 
 # Extraction performance knobs -- both null by default, meaning "auto-detect from
 # whatever machine this is running on" rather than a value tuned to one dev machine

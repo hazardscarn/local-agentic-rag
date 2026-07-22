@@ -281,3 +281,9 @@ cache/
 data/
 docling_exp/
 documentations/
+
+RESEARCHER_AGENT_STATUS.md
+ollama_claude_.txt
+CHANGELOG_RESEARCHER_AGENT.md
+agentic_rag_debug.md
+

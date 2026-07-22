@@ -85,13 +85,26 @@ export default function ChatPage() {
 
   useEffect(() => {
     if (sessionDetail) {
-      setTurns(
-        sessionDetail.messages.map((m) => ({
-          role: m.role,
-          content: m.content,
-          citations: m.citations ?? undefined,
-          modelUsed: m.model_used ?? undefined,
-        })),
+      // The server never persists pipelineTrace/thinking (client-only fields, see
+      // ChatTurn) -- a naive replace here would wipe them off a turn that was JUST
+      // appended locally by onChatSuccess the moment this session's id becomes known
+      // for the first time (new-session sends only learn session_id from the
+      // response, which triggers this query for the first time on message #1's own
+      // turn). Preserve them from the outgoing turns when the same message is still
+      // at the same index, so message #1 keeps its trace exactly like #2+ does.
+      setTurns((prev) =>
+        sessionDetail.messages.map((m, i) => {
+          const existing = prev[i];
+          const sameMessage = existing?.role === m.role && existing?.content === m.content;
+          return {
+            role: m.role,
+            content: m.content,
+            citations: m.citations ?? undefined,
+            modelUsed: m.model_used ?? undefined,
+            thinking: sameMessage ? existing.thinking : undefined,
+            pipelineTrace: sameMessage ? existing.pipelineTrace : undefined,
+          };
+        }),
       );
     }
   }, [sessionDetail]);
@@ -322,7 +335,7 @@ export default function ChatPage() {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="flex-1 overflow-y-auto px-6 py-6">
-          <div className="mx-auto flex max-w-3xl flex-col gap-6">
+          <div className="mx-auto flex max-w-4xl flex-col gap-6">
             {turns.length === 0 && (
               <div className="flex flex-col items-center gap-2 py-16 text-center text-muted-foreground">
                 <Sparkles className="size-6" />
@@ -389,7 +402,7 @@ export default function ChatPage() {
         </div>
 
         <div className="border-t border-border px-6 py-4">
-          <div className="mx-auto flex max-w-3xl items-end gap-2">
+          <div className="mx-auto flex max-w-4xl items-end gap-2">
             <Textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}

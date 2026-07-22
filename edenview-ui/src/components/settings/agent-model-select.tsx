@@ -25,7 +25,7 @@ export function AgentModelSelect({
   label: string;
   value: string; // "" means unset when allowUnset
   onChange: (v: string) => void;
-  capability: "tools" | "vision";
+  capability: "tools" | "vision" | "embedding";
   models: OllamaModelCapabilities[];
   allowUnset?: boolean;
   unsetLabel?: string;
@@ -44,7 +44,9 @@ export function AgentModelSelect({
       {compatible.length === 0 ? (
         <p className="text-xs text-muted-foreground">
           No pulled model reports &quot;{capability}&quot; support -- pull one first (e.g. {" "}
-          <code className="rounded bg-muted px-1 py-0.5">ollama pull qwen3.5:4b</code>).
+          <code className="rounded bg-muted px-1 py-0.5">
+            ollama pull {capability === "embedding" ? "bge-m3" : "qwen3.5:4b"}
+          </code>).
         </p>
       ) : (
         <Select

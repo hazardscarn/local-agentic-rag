@@ -7,9 +7,10 @@
 // iterations (a flat Record<node, status> would only ever show the LAST one).
 //
 // Mirrors the real pipeline shape (edenview_RAG/agentic_rag/agent.py):
-//   question_capture -> decompose -> subquestion_orchestrator (once per sub-question:
-//   subquestion_loop -> [reworder?, search_executor(+vector_search), eval,
-//   deep_search?(+its tool calls)]) -> answer_formatter.
+// NEW: question_capture -> researcher (single unified agent with internal parallel tool calls).
+// OLD (legacy, kept for backward compat):
+//   question_capture -> decompose -> subquestion_orchestrator -> [subquestion_loop ->
+//   [reworder?, search_executor(+vector_search), eval, deep_search?(+its tool calls)]] -> answer_formatter.
 
 import type { AgenticStatusEvent } from "./types";
 
@@ -34,14 +35,23 @@ export interface SubquestionThread {
 }
 
 export interface PipelineState {
+  // Unified researcher agent state (NEW architecture)
+  researcher: NodeRun | null;
+  // root_agent wraps researcher as an AgentTool call (see agent.py) -- tracked
+  // separately so the flowchart can show a real "Start" node ahead of Researcher
+  // instead of only appearing once the researcher's own first event arrives.
+  rootAgent: NodeRun | null;
+  // Legacy fields (kept for backward compat -- never written by new pipeline but still read)
   questionCapture: NodeRun | null;
   decompose: NodeRun | null;
   threads: SubquestionThread[];
   answerFormatter: NodeRun | null;
-  rootMessage: string | null; // last node-less relayed message, e.g. "Working (query_pipeline)..."
+  rootMessage: string | null; // last node-less relayed message
 }
 
 export const initialPipelineState: PipelineState = {
+  researcher: null,
+  rootAgent: null,
   questionCapture: null,
   decompose: null,
   threads: [],
@@ -89,10 +99,56 @@ function upsertSingleton(current: NodeRun | null, event: AgenticStatusEvent, nod
 export function pipelineReducer(state: PipelineState, event: AgenticStatusEvent): PipelineState {
   const { node, phase } = event;
 
+  // root_agent wraps researcher as an AgentTool call -- gives the flowchart a
+  // real "Start" node that lights up before researcher's own first event.
+  if (node === "root_agent") {
+    return { ...state, rootAgent: upsertSingleton(state.rootAgent, event, node) };
+  }
+
+  // Unified researcher agent (NEW architecture) -- single agent with parallel tool calls.
+  if (node === "researcher") {
+    if (phase === "start") {
+      return { ...state, researcher: startNodeRun(node, "agent", event.message || "Researching...") };
+    }
+    if (phase === "end" && state.researcher) {
+      return { ...state, researcher: { ...state.researcher, status: "done", duration_s: event.duration_s } };
+    }
+    return state;
+  }
+
+  // Node-less events relay a human-readable message directly (no agent/tool node).
   if (!node) {
     return event.message ? { ...state, rootMessage: event.message } : state;
   }
 
+  // When researcher is active (running), attach tool events to the researcher's children.
+  // This is how we capture vector_search calls, deep-dive tools, etc. under the single
+  // researcher node — mirroring what callbacks.track_tool_start/end emit during the turn.
+  if (state.researcher && state.researcher.status === "running") {
+    const isTool = TOOL_NODE_NAMES.has(node);
+    if (!isTool) return state; // unrecognized for researcher mode
+
+    if (phase === "start") {
+      const childRun = startNodeRun(node, "tool", event.message || node);
+      return { ...state, researcher: { ...state.researcher, children: [...state.researcher.children, childRun] } };
+    }
+    if (phase === "end" && state.researcher) {
+      // Find the matching running tool call under researcher and mark it done.
+      const newChildren = [...state.researcher.children];
+      let foundIdx = -1;
+      for (let i = newChildren.length - 1; i >= 0; i--) {
+        if (newChildren[i].node === node && newChildren[i].status === "running") {
+          foundIdx = i;
+          break;
+        }
+      }
+      if (foundIdx === -1) return state; // no matching start seen -- drop
+      newChildren[foundIdx] = { ...newChildren[foundIdx], status: "done", duration_s: event.duration_s };
+      return { ...state, researcher: { ...state.researcher, children: newChildren } };
+    }
+  }
+
+  // Legacy top-level agent names (kept for backward compatibility).
   if (node === "question_capture") {
     return { ...state, questionCapture: upsertSingleton(state.questionCapture, event, node) };
   }

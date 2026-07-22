@@ -174,6 +174,7 @@ async function _consumeChatStream(
           phase: event.phase,
           message: event.message,
           duration_s: event.duration_s,
+          query: event.query,
           subquestion_index: event.subquestion_index,
           subquestion_total: event.subquestion_total,
           subquestion_text: event.subquestion_text,
